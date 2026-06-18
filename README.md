@@ -1,6 +1,6 @@
 # 🌾 MÙA VÀNG AGENT
 > Hệ thống Multi-Agent cảnh báo sâu bệnh cà phê Tây Nguyên  
-> **Hackathon Demo** · Powered by Gemini 1.5 + CrewAI + OpenWeatherMap
+> **Hackathon Demo** · Powered by Groq Llama + CrewAI + Claude Vision + OpenWeatherMap
 
 ---
 
@@ -24,11 +24,15 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
-Mở file `.env` và điền:
-- `GROQ_API_KEY` → lấy miễn phí tại [https://console.groq.com](https://console.groq.com/keys)
-- `OPENWEATHER_API_KEY` → đăng ký miễn phí tại [openweathermap.org](https://openweathermap.org/api)
+Mở file `.env` và điền các key cần thiết:
 
-> ⚠️ **Không có API key?** App vẫn chạy được với dữ liệu mô phỏng!
+| Key | Mô tả | Lấy tại |
+|-----|-------|---------|
+| `GROQ_API_KEY` | Dùng cho CrewAI agents (Llama 3) | [console.groq.com](https://console.groq.com/keys) |
+| `OPENWEATHER_API_KEY` | Dữ liệu thời tiết thực tế | [openweathermap.org](https://openweathermap.org/api) |
+| `ANTHROPIC_API_KEY` | *(Tùy chọn)* Phân tích ảnh bằng Claude Vision | [console.anthropic.com](https://console.anthropic.com/) |
+
+> ⚠️ **Không có API key?** App vẫn chạy được với dữ liệu mô phỏng (weather mock, fallback report)!
 
 ### 3. Khởi động
 ```bash
@@ -43,7 +47,8 @@ Mở trình duyệt tại `http://localhost:8501`
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                   STREAMLIT FRONTEND                     │
-│   Input: Vị trí + Câu hỏi nông dân                     │
+│   • Upload ảnh (Claude Vision)                         │
+│   • Nhập vị trí & câu hỏi                              │
 └──────────────────────┬──────────────────────────────────┘
                        │
          ┌─────────────▼─────────────┐
@@ -59,14 +64,16 @@ Mở trình duyệt tại `http://localhost:8501`
                        │
          ┌─────────────▼─────────────┐
          │      CREWAI CREW          │
-         │                           │
-         │  Agent 1 → Agent 2        │
          │  (Sequential Process)     │
+         │                           │
+         │  Agent 1: Disease Spec.   │
+         │  Agent 2: Agri Advisor    │
+         │  Agent 3: Economic Analyst│
          └─────────────┬─────────────┘
                        │
          ┌─────────────▼─────────────┐
-         │  lama-3.3-70b-versatile   │
-         │                           │
+         │  llama3-70b-8192 (Groq)   │
+         │  (miễn phí, siêu nhanh)   │
          └─────────────┬─────────────┘
                        │
          ┌─────────────▼─────────────┐
@@ -81,23 +88,35 @@ Mở trình duyệt tại `http://localhost:8501`
 
 ```
 mua-vang-agent/
-├── app.py              # Streamlit app chính
-├── diseases.json       # Knowledge base 6 bệnh cà phê
-├── requirements.txt    # Thư viện Python
-├── .env.example        # Mẫu cấu hình môi trường
-└── README.md           # File này
+├── app.py                  # Streamlit app chính (có tích hợp Vision)
+├── ai/
+│   ├── classifier.py       # HuggingFace / Claude Vision backend
+│   ├── disease_mapper.py   # Tra cứu knowledge base
+│   ├── risk_engine.py      # Tính điểm rủi ro dựa trên thời tiết
+│   └── agents.py           # CrewAI manager (Groq)
+├── data/
+│   └── diseases.json       # Knowledge base 6 bệnh cà phê
+├── models/
+│   └── plant_disease_model/ # (Tùy chọn) model HuggingFace
+├── requirements.txt        # Thư viện Python
+├── .env.example            # Mẫu cấu hình môi trường
+└── README.md               # File này
 ```
 
-## 🌿 Knowledge Base: Bệnh hại Cà phê
+## 🌿 Knowledge Base: Bệnh hại Cà phê Tây Nguyên
 
-| Bệnh | Loại | Mức độ | Thiệt hại |
-|------|------|--------|-----------|
-| Gỉ Sắt (Rust) | Nấm | Cao | 20-80% |
-| Rệp Sáp | Côn trùng | Cao | 15-50% |
-| Sâu Đục Quả | Côn trùng | Rất cao | 30-80% |
-| Thán Thư | Nấm | Trung bình | 10-40% |
-| Vàng Lá - Thối Rễ | Nấm đất | Cao | 50-100% |
-| Khô Cành - Chết Ngược | Nấm | Trung bình | 10-30% |
+Hệ thống tích hợp sẵn 6 bệnh phổ biến, được định nghĩa trong `diseases.json`:
+
+| Bệnh | Loại | Mức độ | Thiệt hại năng suất |
+|------|------|--------|---------------------|
+| Gỉ sắt (Coffee Leaf Rust) | Nấm | Cao | 30–60% |
+| Vàng lá (Chlorosis) | Sinh lý | Trung bình | 15–30% |
+| Đốm mắt cua (Brown Eye Spot) | Nấm | Trung bình | 10–25% |
+| Nấm hồng (Pink Disease) | Nấm | Cao | 20–50% |
+| Đốm nâu lá (Cercospora) | Nấm | Thấp | 5–15% |
+| Khô cành/Chết ngọn (Dieback) | Nấm/Côn trùng | Cao | 20–40% |
+
+Mỗi bệnh bao gồm: điều kiện bùng phát (nhiệt độ, độ ẩm, mưa), triệu chứng, khuyến cáo xử lý, và tác động kinh tế.
 
 ## ⚙️ Yêu cầu hệ thống
 
@@ -109,8 +128,11 @@ mua-vang-agent/
 
 | Service | URL | Tier miễn phí |
 |---------|-----|---------------|
-| GROQ | [console.groq.com](https://console.groq.com/keys) | 1000 req/min |
+| Groq (Llama 3) | [console.groq.com](https://console.groq.com/keys) | 1000 req/min |
 | OpenWeatherMap | [openweathermap.org](https://openweathermap.org/api) | 60 req/min |
+| Anthropic Claude | [console.anthropic.com](https://console.anthropic.com/) | Credit $5 (dùng thử) |
+
+> 💡 **Mẹo:** Nếu không có Anthropic key, tính năng nhận diện ảnh sẽ bị tắt nhưng các agent vẫn hoạt động bình thường.
 
 ---
 
@@ -121,11 +143,26 @@ mua-vang-agent/
 pip install crewai==0.30.11 --upgrade
 ```
 
+**Lỗi thiếu `langchain_groq`:**
+```bash
+pip install langchain-groq
+```
+
 **OpenWeatherMap 404 (không tìm thấy địa điểm):**  
 Nhập tên thành phố tiếng Anh không dấu: `Pleiku`, `Buon Ma Thuot`, `Gia Nghia`
 
-**Gemini API 429 (quá giới hạn):**  
-Chờ 1-2 phút hoặc chuyển sang dùng `gemini-1.5-flash` (nhanh hơn, ít tốn quota hơn)
+**Groq API 429 (quá giới hạn):**  
+Chờ 1-2 phút hoặc dùng fallback (không cần key). Hệ thống tự động chuyển sang chế độ mô phỏng.
+
+**Claude Vision không hoạt động:**  
+- Kiểm tra `ANTHROPIC_API_KEY` trong `.env`
+- Đảm bảo đã cài `anthropic` (phiên bản >=0.18.0)
+- Nếu vẫn lỗi, app vẫn chạy nhưng không phân tích ảnh.
+
+## 📊 Demo & Mở rộng
+
+- **Mô phỏng Zalo Alert:** Hiển thị cảnh báo dạng tin nhắn Zalo để minh họa luồng thông báo đến nông dân.
+- **Có thể mở rộng:** Thêm nhiều bệnh hơn, tích hợp dữ liệu vệ tinh, hoặc kết nối với hệ thống khuyến nông thực tế.
 
 ---
 
