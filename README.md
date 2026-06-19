@@ -1,6 +1,6 @@
 # 🌾 MÙA VÀNG AGENT
 > Hệ thống Multi-Agent cảnh báo sâu bệnh cà phê Tây Nguyên  
-> **Hackathon Demo** · Powered by Groq Llama + CrewAI + Claude Vision + OpenWeatherMap
+> **AI no1** · Powered by **Groq (Text + Vision)** + OpenWeatherMap
 
 ---
 
@@ -18,36 +18,27 @@ source venv/bin/activate        # Linux/Mac
 
 # Cài thư viện
 pip install -r requirements.txt
-```
-
-### 2. Cấu hình API keys
-```bash
+2. Cấu hình API keys
+bash
 cp .env.example .env
-```
-Mở file `.env` và điền các key cần thiết:
+Mở file .env và điền các key cần thiết:
 
-| Key | Mô tả | Lấy tại |
-|-----|-------|---------|
-| `GROQ_API_KEY` | Dùng cho CrewAI agents (Llama 3) | [console.groq.com](https://console.groq.com/keys) |
-| `OPENWEATHER_API_KEY` | Dữ liệu thời tiết thực tế | [openweathermap.org](https://openweathermap.org/api) |
-| `ANTHROPIC_API_KEY` | *(Tùy chọn)* Phân tích ảnh bằng Claude Vision | [console.anthropic.com](https://console.anthropic.com/) |
+Key	Mô tả	Lấy tại
+GROQ_API_KEY	BẮT BUỘC – Dùng cho cả Text và Vision (Llama 3 & Vision)	console.groq.com
+OPENWEATHER_API_KEY	(Tùy chọn) Dữ liệu thời tiết thực tế	openweathermap.org
+⚠️ Chỉ cần GROQ_API_KEY là đủ để vận hành toàn bộ hệ thống (text + vision).
+Không còn phụ thuộc vào Anthropic / Claude Vision nữa.
 
-> ⚠️ **Không có API key?** App vẫn chạy được với dữ liệu mô phỏng (weather mock, fallback report)!
-
-### 3. Khởi động
-```bash
+3. Khởi động
+bash
 streamlit run app.py
-```
-Mở trình duyệt tại `http://localhost:8501`
+Mở trình duyệt tại http://localhost:8501
 
----
-
-## 🤖 Kiến trúc Multi-Agent
-
-```
+🤖 Kiến trúc Multi-Agent (đã cập nhật)
+text
 ┌─────────────────────────────────────────────────────────┐
 │                   STREAMLIT FRONTEND                     │
-│   • Upload ảnh (Claude Vision)                         │
+│   • Upload ảnh (Groq Vision)                           │
 │   • Nhập vị trí & câu hỏi                              │
 └──────────────────────┬──────────────────────────────────┘
                        │
@@ -63,16 +54,16 @@ Mở trình duyệt tại `http://localhost:8501`
          └─────────────┬─────────────┘
                        │
          ┌─────────────▼─────────────┐
-         │      CREWAI CREW          │
-         │  (Sequential Process)     │
+         │    DUAL-AGENT SYSTEM      │
+         │  (Groq Llama 3)           │
          │                           │
-         │  Agent 1: Disease Spec.   │
-         │  Agent 2: Agri Advisor    │
-         │  Agent 3: Economic Analyst│
+         │  Agent 1: Weather & Disease│
+         │  Agent 2: Economics       │
          └─────────────┬─────────────┘
                        │
          ┌─────────────▼─────────────┐
          │  llama3-70b-8192 (Groq)   │
+         │  + Vision Model           │
          │  (miễn phí, siêu nhanh)   │
          └─────────────┬─────────────┘
                        │
@@ -80,90 +71,65 @@ Mở trình duyệt tại `http://localhost:8501`
          │       KẾT QUẢ             │
          │  • Cảnh báo bệnh hại      │
          │  • Dự báo kinh tế         │
+         │  • Nhận diện ảnh          │
          │  • Mô phỏng Zalo Alert    │
          └───────────────────────────┘
-```
-
-## 📁 Cấu trúc Project
-
-```
+📁 Cấu trúc Project
+text
 mua-vang-agent/
-├── app.py                  # Streamlit app chính (có tích hợp Vision)
-├── ai/
-│   ├── classifier.py       # HuggingFace / Claude Vision backend
-│   ├── disease_mapper.py   # Tra cứu knowledge base
-│   ├── risk_engine.py      # Tính điểm rủi ro dựa trên thời tiết
-│   └── agents.py           # CrewAI manager (Groq)
-├── data/
-│   └── diseases.json       # Knowledge base 6 bệnh cà phê
-├── models/
-│   └── plant_disease_model/ # (Tùy chọn) model HuggingFace
+├── app.py                  # Ứng dụng Streamlit chính (tích hợp Groq Vision)
+├── diseases.json           # Knowledge base (6 bệnh cà phê)
 ├── requirements.txt        # Thư viện Python
 ├── .env.example            # Mẫu cấu hình môi trường
 └── README.md               # File này
-```
+Lưu ý: Project hiện tại không sử dụng CrewAI hay các agent phức tạp.
+Thay vào đó là 2 agent đơn giản chạy tuần tự qua Groq API.
 
-## 🌿 Knowledge Base: Bệnh hại Cà phê Tây Nguyên
+🌿 Knowledge Base: Bệnh hại Cà phê Tây Nguyên
+Hệ thống tích hợp sẵn 6 bệnh phổ biến, được định nghĩa trong diseases.json:
 
-Hệ thống tích hợp sẵn 6 bệnh phổ biến, được định nghĩa trong `diseases.json`:
-
-| Bệnh | Loại | Mức độ | Thiệt hại năng suất |
-|------|------|--------|---------------------|
-| Gỉ sắt (Coffee Leaf Rust) | Nấm | Cao | 30–60% |
-| Vàng lá (Chlorosis) | Sinh lý | Trung bình | 15–30% |
-| Đốm mắt cua (Brown Eye Spot) | Nấm | Trung bình | 10–25% |
-| Nấm hồng (Pink Disease) | Nấm | Cao | 20–50% |
-| Đốm nâu lá (Cercospora) | Nấm | Thấp | 5–15% |
-| Khô cành/Chết ngọn (Dieback) | Nấm/Côn trùng | Cao | 20–40% |
-
+Bệnh	Loại	Mức độ	Thiệt hại năng suất
+Gỉ sắt (Coffee Leaf Rust)	Nấm	Cao	30–60%
+Vàng lá (Chlorosis)	Sinh lý	Trung bình	15–30%
+Đốm mắt cua (Brown Eye Spot)	Nấm	Trung bình	10–25%
+Nấm hồng (Pink Disease)	Nấm	Cao	20–50%
+Đốm nâu lá (Cercospora)	Nấm	Thấp	5–15%
+Khô cành/Chết ngọn (Dieback)	Nấm/Côn trùng	Cao	20–40%
 Mỗi bệnh bao gồm: điều kiện bùng phát (nhiệt độ, độ ẩm, mưa), triệu chứng, khuyến cáo xử lý, và tác động kinh tế.
 
-## ⚙️ Yêu cầu hệ thống
+⚙️ Yêu cầu hệ thống
+Python 3.10+
 
-- Python 3.10+
-- RAM: 2GB+
-- Kết nối Internet (để gọi API)
+RAM: 2GB+
 
-## 🔑 API Keys miễn phí
+Kết nối Internet (để gọi API Groq)
 
-| Service | URL | Tier miễn phí |
-|---------|-----|---------------|
-| Groq (Llama 3) | [console.groq.com](https://console.groq.com/keys) | 1000 req/min |
-| OpenWeatherMap | [openweathermap.org](https://openweathermap.org/api) | 60 req/min |
-| Anthropic Claude | [console.anthropic.com](https://console.anthropic.com/) | Credit $5 (dùng thử) |
+🔑 API Keys miễn phí
+Service	URL	Tier miễn phí
+Groq (Llama 3 + Vision)	console.groq.com	1000 req/min
+OpenWeatherMap	openweathermap.org	60 req/min (không bắt buộc)
+💡 Không có OpenWeatherMap key? App tự động chuyển sang dữ liệu mô phỏng.
 
-> 💡 **Mẹo:** Nếu không có Anthropic key, tính năng nhận diện ảnh sẽ bị tắt nhưng các agent vẫn hoạt động bình thường.
+🛠️ Troubleshooting
+Lỗi use_container_width khi chạy Streamlit:
 
----
+Nâng cấp Streamlit: pip install streamlit --upgrade
 
-## 🛠️ Troubleshooting
+Hoặc sửa tham số thành use_column_width=True trong app.py.
 
-**Lỗi import CrewAI:**
-```bash
-pip install crewai==0.30.11 --upgrade
-```
+Groq API 429 (quá giới hạn):
 
-**Lỗi thiếu `langchain_groq`:**
-```bash
-pip install langchain-groq
-```
+Chờ 1-2 phút hoặc dùng chế độ fallback (không cần key). Hệ thống tự động chuyển sang mô phỏng nếu không có key.
 
-**OpenWeatherMap 404 (không tìm thấy địa điểm):**  
-Nhập tên thành phố tiếng Anh không dấu: `Pleiku`, `Buon Ma Thuot`, `Gia Nghia`
+Lỗi nhận diện ảnh:
 
-**Groq API 429 (quá giới hạn):**  
-Chờ 1-2 phút hoặc dùng fallback (không cần key). Hệ thống tự động chuyển sang chế độ mô phỏng.
+Đảm bảo GROQ_API_KEY có quyền dùng model llama-3.2-90b-vision-preview.
 
-**Claude Vision không hoạt động:**  
-- Kiểm tra `ANTHROPIC_API_KEY` trong `.env`
-- Đảm bảo đã cài `anthropic` (phiên bản >=0.18.0)
-- Nếu vẫn lỗi, app vẫn chạy nhưng không phân tích ảnh.
+Kiểm tra định dạng ảnh (JPG, PNG, WEBP) và dung lượng < 10MB.
 
-## 📊 Demo & Mở rộng
+📊 Demo & Mở rộng
+Mô phỏng Zalo Alert: Hiển thị cảnh báo dạng tin nhắn Zalo để minh họa luồng thông báo đến nông dân.
 
-- **Mô phỏng Zalo Alert:** Hiển thị cảnh báo dạng tin nhắn Zalo để minh họa luồng thông báo đến nông dân.
-- **Có thể mở rộng:** Thêm nhiều bệnh hơn, tích hợp dữ liệu vệ tinh, hoặc kết nối với hệ thống khuyến nông thực tế.
+Có thể mở rộng: Thêm nhiều bệnh hơn, tích hợp dữ liệu vệ tinh, kết nối với hệ thống khuyến nông thực tế.
 
----
-
-*🌾 MÙA VÀNG AGENT · Hackathon AI for Agriculture · Vì một nền nông nghiệp Tây Nguyên thịnh vượng*
+🌾 MÙA VÀNG AGENT · Hackathon AI for Agriculture · Vì một nền nông nghiệp Tây Nguyên thịnh vượng
