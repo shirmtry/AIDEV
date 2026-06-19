@@ -7,7 +7,6 @@
 ## 🚀 Chạy trong 5 phút
 
 ### 1. Clone & cài đặt
-```bash
 # Clone hoặc giải nén project
 cd mua-vang-agent
 
@@ -30,7 +29,7 @@ OPENWEATHER_API_KEY	(Tùy chọn) Dữ liệu thời tiết thực tế	openweat
 Không còn phụ thuộc vào Anthropic / Claude Vision nữa.
 
 3. Khởi động
-bash
+
 streamlit run app.py
 Mở trình duyệt tại http://localhost:8501
 
