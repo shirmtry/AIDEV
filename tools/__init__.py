@@ -1,1 +1,1 @@
-# File này để trống, nó chỉ để đánh dấu rằng thư mục này là một package Python. Bạn có thể thêm các module hoặc subpackage vào đây nếu cần thiết.
+# Package tools - tập hợp các công cụ cho AI Agent Nông Nghiệp
