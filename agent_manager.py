@@ -1,27 +1,19 @@
 import os
 import logging
-import google.generativeai as genai
 from tools.vision_tool import analyze_crop_image
 from tools.scraper_tool import fetch_market_price
 from tools.weather_tool import get_current_weather
 from tools.telegram_tool import send_telegram_message
+from tools.groq_text_tool import call_groq_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class CropDecisionAgent:
     def __init__(self):
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = genai.GenerativeModel('gemini-1.5-flash')  # dùng chung cho tổng hợp
-        self.tools = {
-            "vision": analyze_crop_image,
-            "scraper": fetch_market_price,
-            "weather": get_current_weather,
-            "telegram": send_telegram_message,
-        }
+        pass
 
     def _generate_keyword(self, crop_name):
-        """Tạo từ khóa tìm kiếm từ tên cây trồng (dùng khi nhập thủ công)."""
         mapping = {
             "lúa": "gao", "cà phê": "ca-phe", "tiêu": "tieu",
             "ngô": "ngo", "đậu": "dau", "mía": "mia",
@@ -33,12 +25,10 @@ class CropDecisionAgent:
                 return val
         return crop_lower.replace(" ", "-")
 
-    def run_workflow(self, image_bytes, location="Gia Lai", manual_crop=None, user_telegram_id=None):
+    def run_workflow(self, image_bytes=None, location="Gia Lai", manual_crop=None, user_telegram_id=None):
         logs = []
         context = {
-            "image_bytes": image_bytes,
             "location": location,
-            "manual_crop": manual_crop,
             "user_telegram_id": user_telegram_id,
             "crop_name": None,
             "health": None,
@@ -46,9 +36,10 @@ class CropDecisionAgent:
             "urgency": "Low",
             "market_price": None,
             "weather": None,
+            "search_keyword": "nong-san"
         }
 
-        # ----- Bước 1: Xác định cây trồng (Vision hoặc thủ công) -----
+        # ----- ACT 1: Xác định cây trồng -----
         if manual_crop:
             logs.append(f"📝 [Manual] Người dùng nhập tên cây: **{manual_crop}**")
             context["crop_name"] = manual_crop
@@ -56,89 +47,80 @@ class CropDecisionAgent:
             context["health"] = "Không rõ (do nhập thủ công)"
             context["symptoms"] = "Không có"
             context["urgency"] = "Low"
-        else:
+        elif image_bytes:
             logs.append("🤖 [Act] Đang phân tích hình ảnh cây trồng...")
-            try:
-                vision_result = analyze_crop_image(image_bytes)
-                if vision_result.get("error"):
-                    logs.append(f"❌ [Lỗi Vision] {vision_result.get('message')}. Vui lòng nhập tên cây thủ công.")
-                    # Không có dữ liệu, nhưng vẫn tiếp tục với thông tin mặc định
-                    context["crop_name"] = "Không xác định"
-                    context["search_keyword"] = "nong-san"
-                    context["health"] = "Không rõ"
-                    context["symptoms"] = "Không có"
-                    context["urgency"] = "Low"
-                else:
-                    context["crop_name"] = vision_result.get("crop_name", "Không xác định")
-                    context["search_keyword"] = vision_result.get("search_keyword", "nong-san")
-                    context["health"] = vision_result.get("health_status", "Không rõ")
-                    context["symptoms"] = vision_result.get("symptoms", "Không có")
-                    context["urgency"] = vision_result.get("urgency", "Low")
-                    logs.append(f"🔍 [Observe] Phát hiện cây: **{context['crop_name']}** | Trạng thái: **{context['health']}**")
-            except Exception as e:
-                logs.append(f"❌ [Lỗi Vision] {str(e)}. Vui lòng nhập tên cây thủ công.")
+            vision_result = analyze_crop_image(image_bytes)
+            if vision_result.get("error"):
+                logs.append(f"⚠️ Vision lỗi: {vision_result.get('message')}. Chuyển sang nhập tay.")
+                # Vẫn tiếp tục với thông tin mặc định
                 context["crop_name"] = "Không xác định"
                 context["search_keyword"] = "nong-san"
                 context["health"] = "Không rõ"
                 context["symptoms"] = "Không có"
                 context["urgency"] = "Low"
+            else:
+                context["crop_name"] = vision_result.get("crop_name", "Không xác định")
+                context["search_keyword"] = vision_result.get("search_keyword", "nong-san")
+                context["health"] = vision_result.get("health_status", "Không rõ")
+                context["symptoms"] = vision_result.get("symptoms", "Không có")
+                context["urgency"] = vision_result.get("urgency", "Low")
+                logs.append(f"🔍 [Observe] Phát hiện cây: **{context['crop_name']}** | Trạng thái: **{context['health']}**")
+        else:
+            logs.append("⚠️ Chưa có thông tin cây trồng. Vui lòng nhập tên hoặc tải ảnh.")
+            context["crop_name"] = "Không xác định"
+            context["search_keyword"] = "nong-san"
+            context["health"] = "Không rõ"
+            context["symptoms"] = "Không có"
+            context["urgency"] = "Low"
 
-        # ----- Bước 2: Gọi các tool hỗ trợ (Scraper, Weather) -----
-        # Tool 1: Scraper
-        keyword = context.get("search_keyword", "nong-san")
-        logs.append(f"🌐 [Act] Đang cào giá thị trường thực tế cho từ khóa '{keyword}'...")
+        # ----- ACT 2: Scraper -----
+        keyword = context["search_keyword"]
+        logs.append(f"🌐 [Act] Đang cào giá thị trường cho từ khóa '{keyword}'...")
         try:
-            market_data = fetch_market_price(keyword)
-            context["market_price"] = market_data
+            context["market_price"] = fetch_market_price(keyword)
         except Exception as e:
-            logs.append(f"⚠️ [Lỗi Scraper] {str(e)}. Agent dùng dữ liệu giá mặc định.")
-            context["market_price"] = "Giá thị trường hiện tại: 12,000 VND/kg (dữ liệu tham khảo)"
+            logs.append(f"⚠️ [Lỗi Scraper] {str(e)}. Dùng dữ liệu mặc định.")
+            context["market_price"] = "Giá tham khảo: 12,000 VND/kg"
 
-        # Tool 2: Weather
-        logs.append(f"🌤️ [Act] Đang kiểm tra thời tiết thực tế tại khu vực {location}...")
+        # ----- ACT 3: Weather -----
+        logs.append(f"🌤️ [Act] Đang kiểm tra thời tiết tại {location}...")
         try:
-            weather_data = get_current_weather(location)
-            context["weather"] = weather_data
+            context["weather"] = get_current_weather(location)
         except Exception as e:
-            logs.append(f"⚠️ [Lỗi Weather API] {str(e)}. Agent dùng dữ liệu thời tiết mặc định.")
-            context["weather"] = f"Thời tiết tại {location}: Nắng, Nhiệt độ: 32°C (dữ liệu tham khảo)"
+            logs.append(f"⚠️ [Lỗi Weather] {str(e)}. Dùng dữ liệu mặc định.")
+            context["weather"] = f"Thời tiết tại {location}: Nắng, 32°C"
 
-        # ----- Bước 3: Tổng hợp và đưa ra khuyến nghị (Re-plan) -----
-        logs.append("🧠 [Re-plan & Brainstorm] Agent đang tổng hợp dữ liệu thực tế để ra quyết định...")
+        # ----- OBSERVE (đã có trong logs) -----
+        logs.append("📊 [Observe] Đã thu thập đầy đủ dữ liệu.")
+
+        # ----- RE-PLAN: Tổng hợp khuyến nghị -----
+        logs.append("🧠 [Re-plan] Agent đang tổng hợp dữ liệu để đưa ra khuyến nghị...")
 
         final_prompt = f"""
-        Bạn là một Chuyên gia Nông nghiệp AI Agent tại khu vực Miền Trung - Tây Nguyên.
-        Hãy dựa trên các thông tin THỰC TẾ thu thập được dưới đây để đưa ra khuyến nghị hành động tối ưu nhất cho người nông dân:
-        
-        1. Thông tin cây trồng:
-           - Loại cây: {context['crop_name']}
-           - Sức khỏe: {context['health']}
-           - Triệu chứng: {context['symptoms']}
-           - Mức độ khẩn cấp: {context['urgency']}
-           
-        2. Dữ liệu thô từ thị trường vừa cào live: 
-        {context['market_price']}
-        
-        3. Tình hình thời tiết hiện tại:
-        {context['weather']}
-        
-        Yêu cầu cấu trúc phản hồi rõ ràng, bao gồm:
-        - **Chẩn đoán tình trạng hiện tại**.
-        - **Phân tích biến động giá** và **dự báo thời tiết** ảnh hưởng thế nào đến việc thu hoạch/bán nông sản này.
-        - **Khuyến nghị hành động cụ thể** (Cần phun thuốc gì? Có nên bán ngay hay tích trữ? Biện pháp ứng phó thời tiết).
-        """
+Bạn là chuyên gia nông nghiệp tại Miền Trung - Tây Nguyên. Dựa trên thông tin sau, đưa ra khuyến nghị chi tiết bằng tiếng Việt.
 
-        try:
-            response = self.model.generate_content(final_prompt)
-            if response.candidates:
-                final_decision = response.text
-            else:
-                final_decision = "⚠️ Agent không thể đưa ra khuyến nghị do lỗi từ mô hình. Vui lòng thử lại."
-        except Exception as e:
-            logs.append(f"❌ [Lỗi Gemini] {str(e)}")
-            final_decision = "⚠️ Agent không thể đưa ra khuyến nghị do lỗi hệ thống. Vui lòng thử lại sau."
+1. Cây trồng: {context['crop_name']}
+   Sức khỏe: {context['health']}
+   Triệu chứng: {context['symptoms']}
+   Mức độ khẩn cấp: {context['urgency']}
 
-        # ----- Bước 4: Gửi báo cáo qua Telegram nếu có chat_id -----
+2. Giá thị trường:
+{context['market_price']}
+
+3. Thời tiết:
+{context['weather']}
+
+Hãy đưa ra:
+- Chẩn đoán tình trạng cây.
+- Phân tích ảnh hưởng của giá và thời tiết.
+- Khuyến nghị cụ thể: nên bán hay giữ? biện pháp xử lý bệnh? ứng phó thời tiết?
+"""
+        final_decision = call_groq_text(final_prompt)
+        if final_decision.startswith("⚠️") or final_decision.startswith("❌"):
+            logs.append(f"❌ [Lỗi Groq] {final_decision}")
+            final_decision = "⚠️ Không thể tổng hợp khuyến nghị. Vui lòng thử lại."
+
+        # ----- Nếu có Telegram, gửi báo cáo -----
         if user_telegram_id:
             report = f"🌾 *Báo cáo nông nghiệp*\n\n{final_decision[:2000]}"
             send_result = send_telegram_message(user_telegram_id, report)
