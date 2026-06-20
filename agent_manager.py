@@ -5,6 +5,7 @@ from tools.scraper_tool import fetch_market_price
 from tools.weather_tool import get_current_weather
 from tools.telegram_tool import send_telegram_message
 from tools.groq_text_tool import call_groq_text
+from tools.search_tool import google_search   # import tool mới
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,7 +37,8 @@ class CropDecisionAgent:
             "urgency": "Low",
             "market_price": None,
             "weather": None,
-            "search_keyword": "nong-san"
+            "search_keyword": "nong-san",
+            "search_results": None   # thêm kết quả search
         }
 
         # ----- ACT 1: Xác định cây trồng -----
@@ -52,7 +54,6 @@ class CropDecisionAgent:
             vision_result = analyze_crop_image(image_bytes)
             if vision_result.get("error"):
                 logs.append(f"⚠️ Vision lỗi: {vision_result.get('message')}. Chuyển sang nhập tay.")
-                # Vẫn tiếp tục với thông tin mặc định
                 context["crop_name"] = "Không xác định"
                 context["search_keyword"] = "nong-san"
                 context["health"] = "Không rõ"
@@ -90,6 +91,17 @@ class CropDecisionAgent:
             logs.append(f"⚠️ [Lỗi Weather] {str(e)}. Dùng dữ liệu mặc định.")
             context["weather"] = f"Thời tiết tại {location}: Nắng, 32°C"
 
+        # ----- ACT 4: Google Search (tìm thêm thông tin kỹ thuật) -----
+        search_query = f"{context['crop_name']} cách trồng và chăm sóc khu vực Tây Nguyên"
+        logs.append(f"🔎 [Act] Đang tìm kiếm thông tin bổ sung về '{context['crop_name']}'...")
+        try:
+            search_results = google_search(search_query, num_results=2)
+            context["search_results"] = search_results
+            logs.append("📄 [Observe] Đã nhận được kết quả tìm kiếm.")
+        except Exception as e:
+            logs.append(f"⚠️ [Lỗi Search] {str(e)}. Bỏ qua tìm kiếm.")
+            context["search_results"] = "Không có thông tin tìm kiếm."
+
         # ----- OBSERVE (đã có trong logs) -----
         logs.append("📊 [Observe] Đã thu thập đầy đủ dữ liệu.")
 
@@ -110,10 +122,14 @@ Bạn là chuyên gia nông nghiệp tại Miền Trung - Tây Nguyên. Dựa tr
 3. Thời tiết:
 {context['weather']}
 
+4. Thông tin tìm kiếm bổ sung:
+{context['search_results']}
+
 Hãy đưa ra:
 - Chẩn đoán tình trạng cây.
 - Phân tích ảnh hưởng của giá và thời tiết.
 - Khuyến nghị cụ thể: nên bán hay giữ? biện pháp xử lý bệnh? ứng phó thời tiết?
+- Tận dụng thông tin tìm kiếm để làm phong phú lời khuyên.
 """
         final_decision = call_groq_text(final_prompt)
         if final_decision.startswith("⚠️") or final_decision.startswith("❌"):
