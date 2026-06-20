@@ -7,13 +7,13 @@ load_dotenv()
 
 st.set_page_config(page_title="🌾 AI Agent Giám Sát Nông Nghiệp", layout="wide")
 st.title("🌾 Hệ Thống Multi-Agent Giám Sát Nông Sản Real-time")
-st.caption("Ứng dụng dành riêng cho khu vực Bình Định - Gia Lai | Hackathon AIDEV 2026")
+st.caption("Ứng dụng dành cho khu vực Bình Định - Gia Lai")
 
 with st.sidebar:
     st.header("⚙️ Cấu Hình")
     location = st.selectbox("Chọn địa phương:", ["Gia Lai", "Bình Định"])
     st.markdown("---")
-    st.caption("Hệ thống sử dụng Gemini 2.5 Flash để phân tích ảnh.")
+    st.caption("AI no 1 Group")
 
 st.subheader("📸 Chụp ảnh hoặc Tải ảnh cây trồng")
 img_file = st.camera_input("Chụp hình cây trồng trực tiếp từ thiết bị")
