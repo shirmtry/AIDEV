@@ -40,6 +40,16 @@ let lastPoseAction = '';
 let lastPoseTime = 0;
 const POSE_LOG_INTERVAL = 5000; // 5 seconds
 
+// ==================== HELPER: CAPTURE FRAME FROM VIDEO ====================
+function captureFrameFromVideo(videoElement, quality = 0.8) {
+    const canvas = document.createElement('canvas');
+    canvas.width = videoElement.videoWidth || 640;
+    canvas.height = videoElement.videoHeight || 480;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', quality);
+}
+
 // ==================== HELPER: PARSE FILENAME ====================
 function parseStudentInfoFromFilename(filename) {
     const nameWithoutExt = filename.replace(/\.[^.]+$/, '');
@@ -362,7 +372,7 @@ async function autoRegisterFromSamples() {
             const registerRes = await fetch(`${SERVER_URL}/api/register`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
+                body: JSON.stringify({
                     studentId,
                     name,
                     descriptor,
@@ -482,7 +492,7 @@ function analyzePose(landmarks) {
     return { action: 'unknown', confidence: 0.5 };
 }
 
-// ==================== SỬA HÀM sendPoseLog - THÊM XỬ LÝ LỖI RÕ RÀNG ====================
+// ==================== SỬA HÀM sendPoseLog - THÊM CHỤP ẢNH VÀ GỬI LÊN SERVER ====================
 async function sendPoseLog(action, confidence) {
     if (action === 'unknown') return;
 
@@ -494,17 +504,25 @@ async function sendPoseLog(action, confidence) {
     lastPoseAction = action;
     lastPoseTime = now;
 
+    // Chụp ảnh từ video để gửi kèm log
+    let imageBase64 = null;
+    try {
+        imageBase64 = captureFrameFromVideo(video, 0.8);
+    } catch (e) {
+        console.warn('Không thể chụp ảnh từ video:', e);
+    }
+
     try {
         const response = await fetch(`${SERVER_URL}/api/behavior`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 studentId: 'system',
-                behavior: `Pose: ${action} (${Math.round(confidence * 100)}%)`
+                behavior: `Pose: ${action} (${Math.round(confidence * 100)}%)`,
+                image: imageBase64 // gửi ảnh nếu có
             })
         });
 
-        // Kiểm tra response thành công hay không
         if (!response.ok) {
             const errorText = await response.text();
             console.error(`❌ Lỗi HTTP ${response.status} khi gửi pose log:`, errorText);
@@ -544,16 +562,23 @@ async function initPoseDetection() {
             }
         });
 
-        // Cấu hình Pose
+        // Cấu hình Pose - giảm modelComplexity xuống 0 để tăng tốc
         pose.setOptions({
-            modelComplexity: 1,
+            modelComplexity: 0,   // 0 = Lite, nhanh hơn
             smoothLandmarks: true,
             minDetectionConfidence: 0.5,
             minTrackingConfidence: 0.5
         });
 
+        // Biến đếm frame để skip (tùy chọn)
+        let frameCount = 0;
+
         // Xử lý kết quả
         pose.onResults((results) => {
+            // Skip frame để giảm tải CPU (chỉ xử lý mỗi 2 frame)
+            frameCount++;
+            if (frameCount % 2 !== 0) return;
+
             if (results.poseLandmarks && results.poseLandmarks.length > 0) {
                 // Chuyển landmarks sang định dạng mảng 2D
                 const landmarks = [results.poseLandmarks.map(lm => ({ x: lm.x, y: lm.y, z: lm.z }))];
@@ -564,7 +589,7 @@ async function initPoseDetection() {
             }
         });
 
-        // Tạo Camera và bắt đầu
+        // Tạo Camera và bắt đầu - đã sử dụng độ phân giải thấp hơn
         const camera = new Camera(video, {
             onFrame: async () => {
                 await pose.send({ image: video });
@@ -575,7 +600,7 @@ async function initPoseDetection() {
         await camera.start();
 
         poseInitialized = true;
-        console.log('✅ Pose detector initialized successfully (chỉ dùng thân trên)');
+        console.log('✅ Pose detector initialized successfully (optimized - Lite mode)');
         statusEl.textContent = '✅ Sẵn sàng (có Pose)';
     } catch (err) {
         console.warn('⚠️ Không thể khởi tạo Pose detection:', err.message);
