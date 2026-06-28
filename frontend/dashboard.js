@@ -1,13 +1,12 @@
 // frontend/dashboard.js
-const SERVER_URL = window.location.origin; // Same origin as server
+const SERVER_URL = window.location.origin;
 
 let emotionChart = null;
 let weeklyChart = null;
-let refreshTimer = null;
 let countdownTimer = null;
 let countdownSeconds = 30;
 
-// ==================== INIT ====================
+// ==================== KHỞI TẠO ====================
 document.addEventListener('DOMContentLoaded', () => {
     updateDateLabel();
     initCharts();
@@ -21,9 +20,9 @@ function updateDateLabel() {
     document.getElementById('date-label').textContent = now.toLocaleDateString('vi-VN', options);
 }
 
-// ==================== CHARTS INIT ====================
+// ==================== BIỂU ĐỒ ====================
 function initCharts() {
-    // Emotion pie chart
+    // Biểu đồ cảm xúc (tròn)
     const emotionCtx = document.getElementById('emotionChart').getContext('2d');
     emotionChart = new Chart(emotionCtx, {
         type: 'doughnut',
@@ -43,10 +42,7 @@ function initCharts() {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: {
-                    position: 'right',
-                    labels: { font: { size: 12 }, padding: 12 }
-                },
+                legend: { position: 'right', labels: { font: { size: 12 }, padding: 12 } },
                 tooltip: {
                     callbacks: {
                         label: (ctx) => ` ${ctx.label}: ${ctx.parsed} lần`
@@ -56,7 +52,7 @@ function initCharts() {
         }
     });
 
-    // Weekly attendance bar chart
+    // Biểu đồ điểm danh tuần (cột)
     const weeklyCtx = document.getElementById('weeklyChart').getContext('2d');
     weeklyChart = new Chart(weeklyCtx, {
         type: 'bar',
@@ -95,7 +91,7 @@ function initCharts() {
     });
 }
 
-// ==================== LOAD ALL DATA ====================
+// ==================== TẢI TOÀN BỘ DỮ LIỆU ====================
 async function loadAll() {
     try {
         await Promise.all([
@@ -107,74 +103,97 @@ async function loadAll() {
         ]);
     } catch (e) {
         console.error('Lỗi tải dashboard:', e);
-        showToast('❌ Lỗi tải dữ liệu');
+        showToast('❌ Lỗi tải dữ liệu, vui lòng thử lại');
     }
 }
 
-// ==================== STATS ====================
+// ==================== THỐNG KÊ ====================
 async function loadStats() {
-    const res = await fetch(`${SERVER_URL}/api/stats`);
-    const data = await res.json();
-    const total = data.totalStudents || 0;
-    const present = data.presentToday || 0;
-    const absent = total - present;
-    const rate = total > 0 ? Math.round(present / total * 100) : 0;
+    try {
+        const res = await fetch(`${SERVER_URL}/api/stats`);
+        const data = await res.json();
+        const total = data.totalStudents || 0;
+        const present = data.presentToday || 0;
+        const absent = total - present;
+        const rate = total > 0 ? Math.round(present / total * 100) : 0;
 
-    document.getElementById('stat-total').textContent = total;
-    document.getElementById('stat-present').textContent = present;
-    document.getElementById('stat-absent').textContent = absent;
-    document.getElementById('stat-rate').textContent = rate + '%';
+        document.getElementById('stat-total').textContent = total;
+        document.getElementById('stat-present').textContent = present;
+        document.getElementById('stat-absent').textContent = absent;
+        document.getElementById('stat-rate').textContent = rate + '%';
+    } catch (e) {
+        console.warn('Không tải được stats:', e.message);
+        document.getElementById('stat-total').textContent = '--';
+        document.getElementById('stat-present').textContent = '--';
+        document.getElementById('stat-absent').textContent = '--';
+        document.getElementById('stat-rate').textContent = '--%';
+    }
 }
 
-// ==================== ATTENDANCE TABLES ====================
+// ==================== BẢNG ĐIỂM DANH ====================
 async function loadAttendanceTables() {
-    // All students
-    const allRes = await fetch(`${SERVER_URL}/api/students`);
-    const allStudents = await allRes.json();
+    try {
+        // 1. Lấy tất cả học sinh từ API /api/students
+        const allRes = await fetch(`${SERVER_URL}/api/students`);
+        const rawStudents = await allRes.json();
 
-    // Present today
-    const attRes = await fetch(`${SERVER_URL}/api/attendance`);
-    const attData = await attRes.json();
-    const presentIds = new Set((attData.students || []).map(s => s.id));
+        // Ánh xạ đúng tên trường (studentId -> id, studentName -> name)
+        const allStudents = rawStudents.map(s => ({
+            id: s.studentId,
+            name: s.studentName,
+            gender: s.gender,
+            age: s.age,
+            ...s
+        }));
 
-    const present = allStudents.filter(s => presentIds.has(s.id));
-    const absent = allStudents.filter(s => !presentIds.has(s.id));
+        // 2. Lấy danh sách có mặt hôm nay
+        const attRes = await fetch(`${SERVER_URL}/api/attendance`);
+        const attData = await attRes.json();
+        const presentIds = new Set((attData.students || []).map(s => s.id));
 
-    document.getElementById('present-badge').textContent = `${present.length} học sinh`;
-    document.getElementById('absent-badge').textContent = `${absent.length} học sinh`;
+        const present = allStudents.filter(s => presentIds.has(s.id));
+        const absent = allStudents.filter(s => !presentIds.has(s.id));
 
-    // Present table
-    document.getElementById('present-table-wrap').innerHTML = present.length === 0
-        ? '<div class="loading">Chưa có học sinh nào điểm danh</div>'
-        : `<table>
-            <thead><tr><th>#</th><th>Học sinh</th><th>Mã số</th><th>Trạng thái</th></tr></thead>
-            <tbody>${present.map((s, i) => `
-                <tr>
-                    <td>${i+1}</td>
-                    <td><strong>${s.name}</strong></td>
-                    <td><code>${s.id}</code></td>
-                    <td><span class="badge badge-green">✅ Có mặt</span></td>
-                </tr>`).join('')}
-            </tbody>
-           </table>`;
+        document.getElementById('present-badge').textContent = `${present.length} học sinh`;
+        document.getElementById('absent-badge').textContent = `${absent.length} học sinh`;
 
-    // Absent table
-    document.getElementById('absent-table-wrap').innerHTML = absent.length === 0
-        ? '<div class="loading" style="color:#4caf50">🎉 Tất cả học sinh đều có mặt!</div>'
-        : `<table>
-            <thead><tr><th>#</th><th>Học sinh</th><th>Mã số</th><th>Trạng thái</th></tr></thead>
-            <tbody>${absent.map((s, i) => `
-                <tr>
-                    <td>${i+1}</td>
-                    <td><strong>${s.name}</strong></td>
-                    <td><code>${s.id}</code></td>
-                    <td><span class="badge badge-red">❌ Vắng</span></td>
-                </tr>`).join('')}
-            </tbody>
-           </table>`;
+        // Bảng có mặt
+        document.getElementById('present-table-wrap').innerHTML = present.length === 0
+            ? '<div class="loading">Chưa có học sinh nào điểm danh</div>'
+            : `<table>
+                <thead><tr><th>#</th><th>Học sinh</th><th>Mã số</th><th>Trạng thái</th></tr></thead>
+                <tbody>${present.map((s, i) => `
+                    <tr>
+                        <td>${i+1}</td>
+                        <td><strong>${s.name}</strong></td>
+                        <td><code>${s.id}</code></td>
+                        <td><span class="badge badge-green">✅ Có mặt</span></td>
+                    </tr>`).join('')}
+                </tbody>
+               </table>`;
+
+        // Bảng vắng mặt
+        document.getElementById('absent-table-wrap').innerHTML = absent.length === 0
+            ? '<div class="loading" style="color:#4caf50">🎉 Tất cả học sinh đều có mặt!</div>'
+            : `<table>
+                <thead><tr><th>#</th><th>Học sinh</th><th>Mã số</th><th>Trạng thái</th></tr></thead>
+                <tbody>${absent.map((s, i) => `
+                    <tr>
+                        <td>${i+1}</td>
+                        <td><strong>${s.name}</strong></td>
+                        <td><code>${s.id}</code></td>
+                        <td><span class="badge badge-red">❌ Vắng</span></td>
+                    </tr>`).join('')}
+                </tbody>
+               </table>`;
+    } catch (e) {
+        console.error('Lỗi tải bảng điểm danh:', e);
+        document.getElementById('present-table-wrap').innerHTML = '<div class="loading">❌ Không thể tải dữ liệu</div>';
+        document.getElementById('absent-table-wrap').innerHTML = '<div class="loading">❌ Không thể tải dữ liệu</div>';
+    }
 }
 
-// ==================== EMOTION CHART ====================
+// ==================== BIỂU ĐỒ CẢM XÚC ====================
 async function loadEmotionChart() {
     try {
         const res = await fetch(`${SERVER_URL}/api/emotion/class`);
@@ -197,18 +216,20 @@ async function loadEmotionChart() {
 
         document.getElementById('emotion-total-badge').textContent = `${total} lượt`;
 
-        // Dominant emotion for stat card
         if (stats.length > 0) {
             const dominant = stats[0];
             const icon = emotionLabels[dominant.emotion] || dominant.emotion;
             document.getElementById('stat-emotion').textContent = icon.split(' ')[0];
+        } else {
+            document.getElementById('stat-emotion').textContent = '😐';
         }
     } catch (e) {
         console.warn('Không tải được emotion stats:', e.message);
+        document.getElementById('stat-emotion').textContent = '--';
     }
 }
 
-// ==================== WEEKLY CHART ====================
+// ==================== BIỂU ĐỒ TUẦN ====================
 async function loadWeeklyChart() {
     try {
         const today = new Date();
@@ -216,7 +237,6 @@ async function loadWeeklyChart() {
         const presentData = [];
         const absentData = [];
 
-        // Get last 7 days
         for (let i = 6; i >= 0; i--) {
             const d = new Date(today);
             d.setDate(d.getDate() - i);
@@ -244,7 +264,7 @@ async function loadWeeklyChart() {
     }
 }
 
-// ==================== BEHAVIOR LOG ====================
+// ==================== NHẬT KÝ HÀNH VI ====================
 async function loadBehaviorLog() {
     try {
         const res = await fetch(`${SERVER_URL}/api/behavior/today`);
@@ -278,12 +298,13 @@ async function loadBehaviorLog() {
             </div>`;
         }).join('');
     } catch (e) {
+        console.warn('Không tải được behavior log:', e.message);
         document.getElementById('behavior-feed').innerHTML =
             '<div class="loading">Không thể tải nhật ký hành vi</div>';
     }
 }
 
-// ==================== ACTIONS ====================
+// ==================== CÁC HÀNH ĐỘNG (XUẤT BÁO CÁO) ====================
 async function sendReport() {
     showToast('⏳ Đang gửi báo cáo...');
     try {
@@ -295,19 +316,40 @@ async function sendReport() {
     }
 }
 
-async function exportSheets() {
-    showToast('⏳ Đang xuất Google Sheets...');
+async function exportCSV() {
+    showToast('⏳ Đang tạo file CSV...');
     try {
-        const res = await fetch(`${SERVER_URL}/api/sheets/export`, { method: 'POST' });
-        const data = await res.json();
-        if (data.success) {
-            showToast('✅ Đã xuất lên Google Sheets!');
-            if (data.url) window.open(data.url, '_blank');
-        } else {
-            showToast('❌ ' + (data.error || 'Lỗi xuất Sheets'));
-        }
+        const res = await fetch(`${SERVER_URL}/api/report/csv`);
+        if (!res.ok) throw new Error('Server error');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `diemdanh_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('✅ Đã tải file CSV!');
     } catch (e) {
-        showToast('❌ Lỗi kết nối');
+        showToast('❌ Lỗi xuất CSV: ' + e.message);
+    }
+}
+
+async function exportWeeklyCSV() {
+    const today = new Date().toISOString().slice(0, 10);
+    showToast('⏳ Đang tạo báo cáo tuần...');
+    try {
+        const res = await fetch(`${SERVER_URL}/api/report/week-csv/${today}`);
+        if (!res.ok) throw new Error('Server error');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `baocao_tuan_${today}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('✅ Đã tải báo cáo tuần!');
+    } catch (e) {
+        showToast('❌ Lỗi xuất báo cáo tuần: ' + e.message);
     }
 }
 
@@ -347,11 +389,10 @@ async function exportPDF() {
     }
 }
 
-// ==================== AUTO REFRESH ====================
+// ==================== TỰ ĐỘNG LÀM MỚI ====================
 function startAutoRefresh() {
     countdownSeconds = 30;
     updateCountdown();
-
     clearInterval(countdownTimer);
     countdownTimer = setInterval(() => {
         countdownSeconds--;
@@ -368,7 +409,7 @@ function updateCountdown() {
     if (el) el.textContent = `Cập nhật sau ${countdownSeconds}s`;
 }
 
-// ==================== TOAST ====================
+// ==================== THÔNG BÁO TOAST ====================
 let toastTimer = null;
 function showToast(msg) {
     const t = document.getElementById('toast');
@@ -377,3 +418,11 @@ function showToast(msg) {
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
 }
+
+// Gắn các hàm vào window để dùng trực tiếp từ HTML onclick
+window.sendReport = sendReport;
+window.exportCSV = exportCSV;
+window.exportWeeklyCSV = exportWeeklyCSV;
+window.exportExcel = exportExcel;
+window.exportPDF = exportPDF;
+window.loadAll = loadAll; // cho nút làm mới

@@ -5,7 +5,7 @@ const MODEL_URL = '/models';
 // DOM elements
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
-const ctx = overlay.getContext('2d');
+const ctx = overlay.getContext('2d', { willReadFrequently: true });
 const statusEl = document.getElementById('status');
 const attendanceList = document.getElementById('attendance-list');
 const behaviorLog = document.getElementById('behavior-log');
@@ -21,18 +21,37 @@ const previewImage = document.getElementById('previewImage');
 const registerStatus = document.getElementById('registerStatus');
 const submitRegister = document.getElementById('submitRegister');
 
+// Face detection state
 let isModelLoaded = false;
 let detectionInterval = null;
-const DETECTION_INTERVAL = 2000;
+const DETECTION_INTERVAL = 1500;
 let autoRegisterDone = false;
 let studentList = [];
 
-// Lưu trạng thái cảm xúc tiêu cực để cảnh báo hành vi
+// Emotion tracking for behavior alerts
 const negativeEmotionCount = {};
-const NEGATIVE_EMOTION_THRESHOLD = 5; // số lần cảm xúc tiêu cực liên tiếp
+const NEGATIVE_EMOTION_THRESHOLD = 5;
 const NEGATIVE_EMOTIONS = ['angry', 'sad', 'fearful', 'disgusted'];
 
-// -------------------- LOAD MODELS --------------------
+// Pose detection state
+let poseInitialized = false;
+let poseRunning = false;
+let lastPoseAction = '';
+let lastPoseTime = 0;
+const POSE_LOG_INTERVAL = 5000; // 5 seconds
+
+// ==================== HELPER: PARSE FILENAME ====================
+function parseStudentInfoFromFilename(filename) {
+    const nameWithoutExt = filename.replace(/\.[^.]+$/, '');
+    const parts = nameWithoutExt.split('_');
+    const mssv = parts[parts.length - 1];
+    const nameParts = parts.slice(0, parts.length - 1);
+    let studentName = nameParts.join(' ').trim();
+    if (!studentName) studentName = nameWithoutExt;
+    return { studentId: mssv, name: studentName, raw: nameWithoutExt };
+}
+
+// ==================== LOAD FACE MODELS ====================
 async function loadModels() {
     statusEl.textContent = '⏳ Đang tải mô hình...';
     try {
@@ -41,15 +60,22 @@ async function loadModels() {
         await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
         await faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL);
         await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+        try {
+            await faceapi.nets.ageGenderNet.loadFromUri(MODEL_URL);
+            console.log('✅ Age/Gender model loaded');
+        } catch (e) {
+            console.warn('⚠️ Không tải được ageGenderNet:', e.message);
+        }
+
         isModelLoaded = true;
         statusEl.textContent = '✅ Sẵn sàng';
         statusEl.style.background = '#e8f5e9';
         statusEl.style.color = '#2e7d32';
-        console.log('✅ Model loaded (bao gồm emotion)');
+        console.log('✅ Face models loaded');
 
         await updateStudentList();
         await autoRegisterFromSamples();
-        startVideo();
+        await startVideo();
     } catch (err) {
         console.error(err);
         statusEl.textContent = '❌ Lỗi tải model';
@@ -58,6 +84,7 @@ async function loadModels() {
     }
 }
 
+// ==================== STUDENT LIST ====================
 async function updateStudentList() {
     try {
         const res = await fetch(`${SERVER_URL}/api/students`);
@@ -70,7 +97,7 @@ async function updateStudentList() {
     }
 }
 
-// -------------------- CAMERA --------------------
+// ==================== CAMERA ====================
 async function startVideo() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -83,6 +110,9 @@ async function startVideo() {
         overlay.height = video.videoHeight || 720;
         startAutoDetection();
         updateAttendanceUI();
+
+        // Khởi tạo Pose Detection sau khi camera chạy
+        await initPoseDetection();
     } catch (err) {
         console.error(err);
         statusEl.textContent = '❌ Không thể mở camera';
@@ -91,6 +121,7 @@ async function startVideo() {
     }
 }
 
+// ==================== FACE DETECTION LOOP ====================
 function startAutoDetection() {
     if (detectionInterval) clearInterval(detectionInterval);
     detectionInterval = setInterval(async () => {
@@ -99,19 +130,18 @@ function startAutoDetection() {
     }, DETECTION_INTERVAL);
 }
 
-// -------------------- TIỀN XỬ LÝ ẢNH --------------------
+// ==================== IMAGE PREPROCESS ====================
 function preprocessImage(imageSource) {
     const canvas = document.createElement('canvas');
     canvas.width = imageSource.videoWidth || imageSource.width || 1280;
     canvas.height = imageSource.videoHeight || imageSource.height || 720;
-    const c = canvas.getContext('2d');
+    const c = canvas.getContext('2d', { willReadFrequently: true });
     c.drawImage(imageSource, 0, 0, canvas.width, canvas.height);
 
     const imageData = c.getImageData(0, 0, canvas.width, canvas.height);
     const data = imageData.data;
-
-    const brightness = 25;
-    const contrast = 1.3;
+    const brightness = 20;
+    const contrast = 1.2;
     for (let i = 0; i < data.length; i += 4) {
         data[i] = Math.min(255, Math.max(0, (data[i] - 128) * contrast + 128 + brightness));
         data[i+1] = Math.min(255, Math.max(0, (data[i+1] - 128) * contrast + 128 + brightness));
@@ -121,23 +151,22 @@ function preprocessImage(imageSource) {
     return canvas;
 }
 
-// -------------------- CROP ẢNH --------------------
+// ==================== CROP FACE ====================
 function cropFace(processedCanvas, detection) {
     const box = detection.detection.box;
     const x = Math.max(0, box.x);
     const y = Math.max(0, box.y);
     const width = Math.min(box.width, processedCanvas.width - x);
     const height = Math.min(box.height, processedCanvas.height - y);
-    
     const cropCanvas = document.createElement('canvas');
     cropCanvas.width = width;
     cropCanvas.height = height;
-    const cropCtx = cropCanvas.getContext('2d');
+    const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
     cropCtx.drawImage(processedCanvas, x, y, width, height, 0, 0, width, height);
     return cropCanvas.toDataURL('image/jpeg', 0.9);
 }
 
-// -------------------- HÀM GỬI CẢNH BÁO HÀNH VI --------------------
+// ==================== SEND BEHAVIOR ALERT (emotion-based) ====================
 async function sendBehaviorAlert(studentId, behavior) {
     try {
         const response = await fetch(`${SERVER_URL}/api/behavior`, {
@@ -148,12 +177,10 @@ async function sendBehaviorAlert(studentId, behavior) {
         const data = await response.json();
         if (data.success) {
             console.log(`⚠️ Đã gửi cảnh báo hành vi cho ${studentId}: ${behavior}`);
-            // Cập nhật UI log
             const logEntry = document.createElement('div');
             logEntry.style.color = '#f44336';
             logEntry.textContent = `🚨 ${new Date().toLocaleTimeString()} - ${studentId}: ${behavior}`;
             behaviorLog.prepend(logEntry);
-            // Giới hạn số dòng log
             while (behaviorLog.children.length > 20) {
                 behaviorLog.removeChild(behaviorLog.lastChild);
             }
@@ -163,7 +190,7 @@ async function sendBehaviorAlert(studentId, behavior) {
     }
 }
 
-// -------------------- NHẬN DIỆN --------------------
+// ==================== FACE DETECTION & RECOGNITION ====================
 async function detectAndRecognize() {
     if (!isModelLoaded) return;
 
@@ -173,31 +200,27 @@ async function detectAndRecognize() {
         processedCanvas,
         new faceapi.TinyFaceDetectorOptions({
             inputSize: 608,
-            scoreThreshold: 0.3
+            scoreThreshold: 0.35
         })
     )
     .withFaceLandmarks()
     .withFaceDescriptors()
-    .withFaceExpressions();
+    .withFaceExpressions()
+    .withAgeAndGender();
 
     ctx.clearRect(0, 0, overlay.width, overlay.height);
     if (detections.length === 0) {
-        // Reset trạng thái cảm xúc nếu không có ai
-        for (const key in negativeEmotionCount) {
-            negativeEmotionCount[key] = 0;
-        }
+        for (const key in negativeEmotionCount) negativeEmotionCount[key] = 0;
         return;
     }
 
     const validDetections = detections.filter(d => {
         const box = d.detection.box;
-        return box.width > 60 && box.height > 60;
+        return box.width > 40 && box.height > 40;
     });
 
     if (validDetections.length === 0) {
-        for (const key in negativeEmotionCount) {
-            negativeEmotionCount[key] = 0;
-        }
+        for (const key in negativeEmotionCount) negativeEmotionCount[key] = 0;
         return;
     }
 
@@ -219,42 +242,51 @@ async function detectAndRecognize() {
     });
     const croppedImages = validDetections.map(d => cropFace(processedCanvas, d));
 
-    // Gửi lên server
+    const ageGenders = validDetections.map(d => ({
+        age: d.age ? Math.round(d.age) : null,
+        gender: d.gender || null
+    }));
+
     try {
         const response = await fetch(`${SERVER_URL}/api/recognize-multiple`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ descriptors, emotions, croppedImages })
+            body: JSON.stringify({ descriptors, emotions, croppedImages, ageGenders })
         });
+        if (!response.ok) throw new Error(`HTTP error ${response.status}`);
         const data = await response.json();
         if (data.success) {
             data.results.forEach((result, index) => {
                 const box = resized[index].detection.box;
+                const ag = ageGenders[index] || {};
+
                 if (result.studentId) {
                     ctx.fillStyle = '#4caf50';
-                    ctx.font = 'bold 20px Arial';
-                    ctx.fillText(`       ✅ ${result.studentName}`, box.x, box.y - 10);
+                    ctx.font = 'bold 18px Arial';
+                    ctx.fillText(`       ✅ ${result.studentName}`, box.x, box.y - 28);
+
+                    if (ag.age !== null || ag.gender) {
+                        const genderIcon = ag.gender === 'male' ? '👨' : ag.gender === 'female' ? '👩' : '';
+                        ctx.font = '13px Arial';
+                        ctx.fillStyle = '#00bcd4';
+                        ctx.fillText(`          ${genderIcon} ${ag.gender || ''} ${ag.age ? ag.age + 't' : ''}`, box.x, box.y - 10);
+                    }
+
                     ctx.font = '14px Arial';
                     ctx.fillStyle = '#ffffff';
-                    ctx.fillText(`😊 ${result.emotion}`, box.x, box.y + box.height + 20);
+                    ctx.fillText(`  😊 ${result.emotion}`, box.x, box.y + box.height + 20);
 
-                    // ==== CẢNH BÁO HÀNH VI: theo dõi cảm xúc tiêu cực ====
                     const studentId = result.studentId;
                     const emotion = result.emotion;
 
                     if (NEGATIVE_EMOTIONS.includes(emotion)) {
-                        if (!negativeEmotionCount[studentId]) {
+                        if (!negativeEmotionCount[studentId]) negativeEmotionCount[studentId] = 0;
+                        negativeEmotionCount[studentId]++;
+                        if (negativeEmotionCount[studentId] >= NEGATIVE_EMOTION_THRESHOLD) {
+                            sendBehaviorAlert(studentId, `Cảm xúc tiêu cực kéo dài (${emotion})`);
                             negativeEmotionCount[studentId] = 0;
                         }
-                        negativeEmotionCount[studentId]++;
-                        
-                        if (negativeEmotionCount[studentId] >= NEGATIVE_EMOTION_THRESHOLD) {
-                            // Gửi cảnh báo
-                            sendBehaviorAlert(studentId, `Cảm xúc tiêu cực kéo dài (${emotion})`);
-                            negativeEmotionCount[studentId] = 0; // Reset sau khi gửi
-                        }
                     } else {
-                        // Nếu cảm xúc tích cực, reset bộ đếm
                         negativeEmotionCount[studentId] = 0;
                     }
                 } else {
@@ -271,7 +303,7 @@ async function detectAndRecognize() {
     }
 }
 
-// -------------------- TỰ ĐỘNG ĐĂNG KÝ --------------------
+// ==================== AUTO REGISTER FROM SAMPLES ====================
 async function autoRegisterFromSamples() {
     if (autoRegisterDone) return;
     try {
@@ -291,8 +323,8 @@ async function autoRegisterFromSamples() {
 
         let registeredCount = 0;
         for (const fileName of data.images) {
-            const name = fileName.replace(/\.[^.]+$/, '');
-            console.log(`📸 Đang xử lý: ${fileName}`);
+            const { studentId, name } = parseStudentInfoFromFilename(fileName);
+            console.log(`📸 Đang xử lý: ${fileName} → ID: ${studentId}, Tên: ${name}`);
 
             const imgRes = await fetch(`${SERVER_URL}/api/sample-image/${fileName}`);
             const imgData = await imgRes.json();
@@ -307,7 +339,8 @@ async function autoRegisterFromSamples() {
 
             const detection = await faceapi.detectSingleFace(img)
                 .withFaceLandmarks()
-                .withFaceDescriptor();
+                .withFaceDescriptor()
+                .withAgeAndGender();
 
             if (!detection) {
                 console.warn(`⚠️ Không tìm thấy khuôn mặt trong ${fileName}`);
@@ -315,23 +348,32 @@ async function autoRegisterFromSamples() {
             }
 
             const descriptor = Array.from(detection.descriptor);
-            
+            const gender = detection.gender || null;
+            const age = detection.age ? Math.round(detection.age) : null;
+
             const box = detection.detection.box;
             const cropCanvas = document.createElement('canvas');
             cropCanvas.width = box.width;
             cropCanvas.height = box.height;
-            const cropCtx = cropCanvas.getContext('2d');
+            const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
             cropCtx.drawImage(img, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
             const croppedImage = cropCanvas.toDataURL('image/jpeg', 0.9);
 
             const registerRes = await fetch(`${SERVER_URL}/api/register`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ studentId: name, name, descriptor, croppedImage })
+                body: JSON.stringify({ 
+                    studentId,
+                    name,
+                    descriptor,
+                    croppedImage,
+                    gender,
+                    age
+                })
             });
             const result = await registerRes.json();
             if (result.success) {
-                console.log(`✅ Đã đăng ký ${name}`);
+                console.log(`✅ Đã đăng ký ${name} (${studentId})`);
                 registeredCount++;
             } else {
                 console.error(`❌ Lỗi đăng ký ${name}: ${result.error}`);
@@ -346,7 +388,7 @@ async function autoRegisterFromSamples() {
     }
 }
 
-// -------------------- UI --------------------
+// ==================== UPDATE UI ====================
 async function updateAttendanceUI() {
     try {
         const res = await fetch(`${SERVER_URL}/api/attendance`);
@@ -369,7 +411,227 @@ async function updateAttendanceUI() {
     }
 }
 
-// -------------------- SỰ KIỆN NÚT BẤM --------------------
+// ==================== POSE DETECTION (MediaPipe Pose - tích hợp trực tiếp) ====================
+// ----- PHẦN QUAN TRỌNG: SỬA LOGIC PHÂN TÍCH POSE -----
+// Chỉ dùng các landmark có thể nhìn thấy: vai, khuỷu tay, cổ tay, mũi, tai
+// Bỏ qua gối, hông, chân (bị bàn che)
+
+// Hàm tính góc giữa 3 điểm
+function angleBetweenPoints(a, b, c) {
+    const v1 = { x: a.x - b.x, y: a.y - b.y };
+    const v2 = { x: c.x - b.x, y: c.y - b.y };
+    const dot = v1.x * v2.x + v1.y * v2.y;
+    const mag = Math.sqrt(v1.x * v1.x + v1.y * v1.y) * Math.sqrt(v2.x * v2.x + v2.y * v2.y);
+    if (mag === 0) return 0;
+    return Math.acos(dot / mag) * 180 / Math.PI;
+}
+
+// Phân tích tư thế từ landmark (chỉ dùng thân trên)
+function analyzePose(landmarks) {
+    if (!landmarks || landmarks.length === 0) return { action: 'unknown', confidence: 0 };
+
+    const lm = landmarks[0];
+    const nose = lm[0];
+    const leftShoulder = lm[11];
+    const rightShoulder = lm[12];
+    const leftElbow = lm[13];
+    const rightElbow = lm[14];
+    const leftWrist = lm[15];
+    const rightWrist = lm[16];
+    const leftEar = lm[7];
+    const rightEar = lm[8];
+
+    // 1. Giơ tay (cổ tay cao hơn vai)
+    let isRaisingHand = false;
+    if (leftWrist.y < leftShoulder.y - 0.05 || rightWrist.y < rightShoulder.y - 0.05) {
+        isRaisingHand = true;
+    }
+
+    // 2. Cúi đầu / ngủ (mũi thấp hơn vai)
+    const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2;
+    const noseToShoulderY = nose.y - shoulderMidY;
+    let isSleeping = false;
+    if (noseToShoulderY > 0.08) {
+        isSleeping = true;
+    }
+
+    // 3. Ước lượng ngồi/đứng (dùng chiều dài thân trên - không bị che)
+    // Lấy khoảng cách giữa vai và hông (nếu hông không có, dùng elbow làm tham chiếu)
+    // Thực tế, hông có thể bị che, nhưng ta dùng khoảng cách từ vai đến khuỷu tay
+    // và góc khuỷu tay để suy luận tư thế.
+    const shoulderDist = Math.abs(leftShoulder.y - rightShoulder.y);
+    const elbowDist = Math.abs(leftElbow.y - rightElbow.y);
+    // Nếu vai và khuỷu tay gần nhau theo chiều ngang và cùng thấp → ngồi
+    // Còn nếu vai và khuỷu tay xa nhau → đứng
+    // Nhưng đơn giản hơn: nếu không phải giơ tay hay ngủ, mặc định là "sitting" (vì học sinh thường ngồi)
+    // Ta chỉ ghi nhận giơ tay và ngủ, còn lại coi là ngồi.
+    // Nếu muốn phân biệt đứng/ngồi, cần thêm thông tin từ độ cao của vai (so với mặt bàn) - khó.
+
+    // => Ta quyết định: chỉ log 3 hành vi: raising_hand, sleeping, và sitting (mặc định)
+    // Nếu không phải raising_hand và sleeping, coi là sitting.
+    // Với điều kiện có pose hợp lệ (có vai và tay).
+
+    // Kiểm tra nếu có ít nhất một vai và một cổ tay được detect
+    if (leftShoulder && rightShoulder && (leftWrist || rightWrist)) {
+        if (isSleeping) return { action: 'sleeping', confidence: 0.85 };
+        if (isRaisingHand) return { action: 'raising_hand', confidence: 0.9 };
+        // Còn lại coi là ngồi (vì bàn che)
+        return { action: 'sitting', confidence: 0.7 };
+    }
+
+    return { action: 'unknown', confidence: 0.5 };
+}
+
+// ==================== SỬA HÀM sendPoseLog - THÊM XỬ LÝ LỖI RÕ RÀNG ====================
+async function sendPoseLog(action, confidence) {
+    if (action === 'unknown') return;
+
+    const now = Date.now();
+    if (action === lastPoseAction && (now - lastPoseTime) < POSE_LOG_INTERVAL) {
+        return;
+    }
+
+    lastPoseAction = action;
+    lastPoseTime = now;
+
+    try {
+        const response = await fetch(`${SERVER_URL}/api/behavior`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                studentId: 'system',
+                behavior: `Pose: ${action} (${Math.round(confidence * 100)}%)`
+            })
+        });
+
+        // Kiểm tra response thành công hay không
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`❌ Lỗi HTTP ${response.status} khi gửi pose log:`, errorText);
+            return;
+        }
+
+        const data = await response.json();
+        if (data.success) {
+            console.log(`🧍 Pose log: ${action} (${Math.round(confidence * 100)}%)`);
+            const logEntry = document.createElement('div');
+            logEntry.style.color = '#2196f3';
+            logEntry.textContent = `🧍 ${new Date().toLocaleTimeString()} - Hành vi: ${action}`;
+            behaviorLog.prepend(logEntry);
+            while (behaviorLog.children.length > 20) {
+                behaviorLog.removeChild(behaviorLog.lastChild);
+            }
+        } else {
+            console.warn('⚠️ Server trả về success: false', data);
+        }
+    } catch (err) {
+        console.error('❌ Lỗi gửi pose log (fetch):', err);
+    }
+}
+
+// Khởi tạo Pose detector (dùng @mediapipe/pose qua CDN)
+async function initPoseDetection() {
+    if (poseInitialized) return;
+
+    try {
+        // Tải thư viện @mediapipe/pose từ CDN
+        await loadPoseLibrary();
+
+        // Khởi tạo Pose object
+        const pose = new Pose({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+            }
+        });
+
+        // Cấu hình Pose
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        // Xử lý kết quả
+        pose.onResults((results) => {
+            if (results.poseLandmarks && results.poseLandmarks.length > 0) {
+                // Chuyển landmarks sang định dạng mảng 2D
+                const landmarks = [results.poseLandmarks.map(lm => ({ x: lm.x, y: lm.y, z: lm.z }))];
+                const poseResult = analyzePose(landmarks);
+                if (poseResult.action !== 'unknown') {
+                    sendPoseLog(poseResult.action, poseResult.confidence);
+                }
+            }
+        });
+
+        // Tạo Camera và bắt đầu
+        const camera = new Camera(video, {
+            onFrame: async () => {
+                await pose.send({ image: video });
+            },
+            width: 640,
+            height: 480
+        });
+        await camera.start();
+
+        poseInitialized = true;
+        console.log('✅ Pose detector initialized successfully (chỉ dùng thân trên)');
+        statusEl.textContent = '✅ Sẵn sàng (có Pose)';
+    } catch (err) {
+        console.warn('⚠️ Không thể khởi tạo Pose detection:', err.message);
+        // Fallback: vẫn chạy face detection bình thường
+        statusEl.textContent = '✅ Sẵn sàng (không có Pose)';
+    }
+}
+
+// Tải MediaPipe Pose library từ CDN
+function loadPoseLibrary() {
+    return new Promise((resolve, reject) => {
+        // Kiểm tra nếu đã có
+        if (typeof Pose !== 'undefined' && typeof Camera !== 'undefined') {
+            resolve();
+            return;
+        }
+
+        const scripts = [
+            'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js',
+            'https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js',
+            'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js'
+        ];
+
+        let loaded = 0;
+        const total = scripts.length;
+
+        scripts.forEach(src => {
+            const script = document.createElement('script');
+            script.src = src;
+            script.onload = () => {
+                loaded++;
+                if (loaded === total) {
+                    // Đợi một chút để các biến toàn cục được định nghĩa
+                    setTimeout(() => {
+                        if (typeof Pose !== 'undefined' && typeof Camera !== 'undefined') {
+                            resolve();
+                        } else {
+                            reject(new Error('Pose or Camera not defined after loading'));
+                        }
+                    }, 500);
+                }
+            };
+            script.onerror = () => reject(new Error(`Failed to load ${src}`));
+            document.head.appendChild(script);
+        });
+
+        // Timeout phòng trường hợp script lỗi không báo
+        setTimeout(() => {
+            if (typeof Pose !== 'undefined' && typeof Camera !== 'undefined') {
+                resolve();
+            }
+        }, 10000);
+    });
+}
+
+// ==================== UI EVENTS ====================
 document.getElementById('captureBtn').addEventListener('click', async () => {
     await detectAndRecognize();
 });
@@ -379,7 +641,6 @@ document.getElementById('attendanceBtn').addEventListener('click', async () => {
     await updateStudentList();
 });
 
-// -------------------- MODAL ĐĂNG KÝ --------------------
 registerBtn.onclick = function() {
     modal.style.display = 'block';
     studentName.value = '';
@@ -393,9 +654,7 @@ closeBtn.onclick = function() {
 };
 
 window.onclick = function(event) {
-    if (event.target == modal) {
-        modal.style.display = 'none';
-    }
+    if (event.target == modal) modal.style.display = 'none';
 };
 
 imageUpload.addEventListener('change', function(e) {
@@ -430,7 +689,8 @@ submitRegister.addEventListener('click', async function() {
 
     const detection = await faceapi.detectSingleFace(img)
         .withFaceLandmarks()
-        .withFaceDescriptor();
+        .withFaceDescriptor()
+        .withAgeAndGender();
 
     if (!detection) {
         registerStatus.textContent = '❌ Không tìm thấy khuôn mặt trong ảnh. Vui lòng chọn ảnh khác.';
@@ -438,11 +698,13 @@ submitRegister.addEventListener('click', async function() {
     }
 
     const descriptor = Array.from(detection.descriptor);
+    const gender = detection.gender || null;
+    const age = detection.age ? Math.round(detection.age) : null;
     const box = detection.detection.box;
     const cropCanvas = document.createElement('canvas');
     cropCanvas.width = box.width;
     cropCanvas.height = box.height;
-    const cropCtx = cropCanvas.getContext('2d');
+    const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
     cropCtx.drawImage(img, box.x, box.y, box.width, box.height, 0, 0, box.width, box.height);
     const croppedImage = cropCanvas.toDataURL('image/jpeg', 0.9);
 
@@ -450,7 +712,7 @@ submitRegister.addEventListener('click', async function() {
         const response = await fetch(`${SERVER_URL}/api/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ studentId: id, name, descriptor, croppedImage })
+            body: JSON.stringify({ studentId: id, name, descriptor, croppedImage, gender, age })
         });
         const data = await response.json();
         if (data.success) {
@@ -467,4 +729,5 @@ submitRegister.addEventListener('click', async function() {
     }
 });
 
+// ==================== START ====================
 loadModels();

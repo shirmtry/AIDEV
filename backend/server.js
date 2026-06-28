@@ -5,22 +5,13 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
-const { logEvent, registerStudent, getTodayAttendance, getStudentAttendance, getStats, getVietnamTime } = require('./db');
-
-// Part 5 & 6: Optional dependencies (graceful fallback if not installed)
-let PDFDocument = null;
-let ExcelJS = null;
-let sheetsService = null;
-
-try { PDFDocument = require('pdfkit'); } catch (e) { console.warn('⚠️ pdfkit chưa cài: npm install pdfkit'); }
-try { ExcelJS = require('exceljs'); } catch (e) { console.warn('⚠️ exceljs chưa cài: npm install exceljs'); }
-try { sheetsService = require('./services/googleSheets'); } catch (e) { console.warn('⚠️ Google Sheets service chưa sẵn sàng'); }
+const { logEvent, registerStudent, getTodayAttendance, getStudentAttendance, getStats, getVietnamTime, getStudentsWithGender } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ==================== RATE LIMITING (Part 4) ====================
-const requestCounts = {}; // { 'ip:endpoint': { count, resetAt } }
+// ==================== RATE LIMITING ====================
+const requestCounts = {};
 
 function rateLimit(maxRequests, windowMs) {
     return (req, res, next) => {
@@ -127,6 +118,8 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                     const detail = r.details ? JSON.parse(r.details) : {};
                     let line = `${i+1}. ${r.action} ${r.timestamp}`;
                     if (r.action === 'emotion' && detail.emotion) line += ` 😊 ${detail.emotion}`;
+                    if (r.age) line += ` (${r.age} tuổi)`;
+                    if (r.gender) line += ` ${r.gender === 'male' ? '👨' : '👩'}`;
                     message += line + '\n';
                 });
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
@@ -135,7 +128,6 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
             }
         });
 
-        // Part 3: Lệnh xem cảm xúc học sinh
         bot.onText(/\/emotion (.+)/, async (msg, match) => {
             const chatId = msg.chat.id;
             const id = match[1].trim();
@@ -156,7 +148,6 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
             }
         });
 
-        // Part 3: Lệnh xem cảm xúc toàn lớp
         bot.onText(/\/classemotion/, async (msg) => {
             const chatId = msg.chat.id;
             try {
@@ -236,26 +227,28 @@ function ensureStudentFolder(studentId) {
     return folder;
 }
 
-function saveStudentDescriptor(studentId, name, descriptor) {
+// ===== LƯU DESCRIPTOR KÈM GENDER VÀ AGE =====
+function saveStudentDescriptor(studentId, name, descriptor, gender = null, age = null) {
     const folder = ensureStudentFolder(studentId);
     const filePath = path.join(folder, 'descriptor.json');
-    let data = { id: studentId, name, descriptors: [] };
+    let data = { id: studentId, name, descriptors: [], gender, age };
     if (fs.existsSync(filePath)) {
-        try { data = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (e) {}
+        try {
+            const old = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            data.descriptors = old.descriptors || [];
+            if (gender !== null) data.gender = gender;
+            else if (old.gender) data.gender = old.gender;
+            if (age !== null) data.age = age;
+            else if (old.age) data.age = old.age;
+        } catch (e) {}
     }
-    if (!data.descriptors) data.descriptors = [];
     data.descriptors.push(descriptor);
-    if (data.descriptors.length > 20) data.descriptors = data.descriptors.slice(-20);
+    if (data.descriptors.length > 30) data.descriptors = data.descriptors.slice(-30);
     data.name = name;
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-
-    const descriptors = loadDescriptors();
-    const existing = descriptors.find(s => s.id === studentId);
-    if (existing) { existing.name = name; existing.descriptors = data.descriptors; }
-    else descriptors.push({ id: studentId, name, descriptors: data.descriptors });
-    saveDescriptors(descriptors);
 }
 
+// ===== LOAD DESCRIPTOR CÓ GENDER, AGE =====
 function loadAllStudentDescriptors() {
     const allStudents = [];
     if (fs.existsSync(STUDENT_DATA_DIR)) {
@@ -265,8 +258,10 @@ function loadAllStudentDescriptors() {
         for (const folder of folders) {
             const descFile = path.join(STUDENT_DATA_DIR, folder, 'descriptor.json');
             if (fs.existsSync(descFile)) {
-                try { allStudents.push(JSON.parse(fs.readFileSync(descFile, 'utf8'))); }
-                catch (e) { console.warn(`⚠️ Lỗi đọc descriptor ${folder}`); }
+                try {
+                    const data = JSON.parse(fs.readFileSync(descFile, 'utf8'));
+                    allStudents.push(data);
+                } catch (e) { console.warn(`⚠️ Lỗi đọc descriptor ${folder}`); }
             }
         }
     }
@@ -281,18 +276,40 @@ function euclideanDistance(arr1, arr2) {
     return Math.sqrt(sum);
 }
 
-function findBestMatch(descriptor, threshold = 0.6) {
-    let allStudents = loadAllStudentDescriptors();
-    if (allStudents.length === 0) allStudents = loadDescriptors();
-    let bestMatch = null, bestDistance = Infinity;
+// ===== SỬA: TÌM MATCH TỐT NHẤT VỚI THRESHOLD CHẶT CHẼ =====
+function findBestMatch(descriptor, threshold = 0.55) {
+    const allStudents = loadAllStudentDescriptors();
+    if (allStudents.length === 0) return null;
+
+    let bestMatch = null;
+    let bestDistance = Infinity;
+
     for (const student of allStudents) {
-        const descs = student.descriptors || [student.descriptor];
-        for (const desc of descs) {
-            const dist = euclideanDistance(descriptor, desc);
-            if (dist < bestDistance) { bestDistance = dist; bestMatch = student; }
+        const descs = student.descriptors || [];
+        if (descs.length === 0) continue;
+        // Tìm khoảng cách nhỏ nhất đến bất kỳ descriptor nào của học sinh
+        let minDist = Infinity;
+        for (const d of descs) {
+            const dist = euclideanDistance(descriptor, d);
+            if (dist < minDist) minDist = dist;
+        }
+        if (minDist < bestDistance) {
+            bestDistance = minDist;
+            bestMatch = student;
         }
     }
-    return bestMatch && bestDistance < threshold ? { student: bestMatch, distance: bestDistance } : null;
+
+    // Log khoảng cách nhỏ nhất
+    if (bestMatch) {
+        console.log(`🔍 Khoảng cách nhỏ nhất: ${bestDistance.toFixed(4)} với ${bestMatch.name} (${bestMatch.id})`);
+    } else {
+        console.log('❌ Không tìm thấy học sinh nào');
+    }
+
+    if (bestMatch && bestDistance <= threshold) {
+        return { student: bestMatch, distance: bestDistance };
+    }
+    return null;
 }
 
 // ==================== ĐIỂM DANH ====================
@@ -311,7 +328,7 @@ function updateAttendance(studentId) {
     }
 }
 
-// ==================== EMOTION STATS (Part 3) ====================
+// ==================== EMOTION STATS ====================
 const { db } = require('./db');
 
 function getEmotionStats(studentId) {
@@ -456,7 +473,7 @@ function limitCroppedImages(studentId, maxCount = 10) {
 // 1. Đăng ký học sinh
 app.post('/api/register', rateLimit(10, 60000), (req, res) => {
     try {
-        const { studentId, name, descriptor, croppedImage } = req.body;
+        const { studentId, name, descriptor, croppedImage, gender, age } = req.body;
         if (!studentId || !name || !descriptor) return res.status(400).json({ error: 'Thiếu thông tin' });
         if (!Array.isArray(descriptor) || descriptor.length !== 128) {
             return res.status(400).json({ error: 'Descriptor phải là mảng 128 số' });
@@ -464,8 +481,8 @@ app.post('/api/register', rateLimit(10, 60000), (req, res) => {
         if (loadAllStudentDescriptors().find(s => s.id === studentId)) {
             return res.status(400).json({ error: `Học sinh ${studentId} đã tồn tại` });
         }
-        saveStudentDescriptor(studentId, name, descriptor);
-        registerStudent(studentId, name);
+        saveStudentDescriptor(studentId, name, descriptor, gender || null, age || null);
+        registerStudent(studentId, name, gender || null, age || null);
         if (croppedImage) {
             const folder = ensureStudentFolder(studentId);
             const base64Data = croppedImage.replace(/^data:image\/jpeg;base64,/, '');
@@ -478,7 +495,7 @@ app.post('/api/register', rateLimit(10, 60000), (req, res) => {
     }
 });
 
-// 2. Nhận diện nhiều khuôn mặt — hỗ trợ age/gender (Part 2)
+// 2. Nhận diện nhiều khuôn mặt — sử dụng threshold 0.55
 let lastEmotion = {};
 
 app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
@@ -492,7 +509,9 @@ app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
         const recognizedIds = [];
 
         for (let i = 0; i < descriptors.length; i++) {
-            const match = findBestMatch(descriptors[i]);
+            const gender = (ageGenders && ageGenders[i]) ? ageGenders[i].gender : null;
+            // Sử dụng threshold 0.55 thay vì 0.68
+            const match = findBestMatch(descriptors[i], 0.55);
             if (match) {
                 const student = match.student;
                 recognizedIds.push(student.id);
@@ -504,6 +523,7 @@ app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
                     age: ageGenders && ageGenders[i] ? ageGenders[i].age : null,
                     gender: ageGenders && ageGenders[i] ? ageGenders[i].gender : null
                 });
+                console.log(`✅ Nhận diện thành công: ${student.name} (${student.id}) - khoảng cách ${match.distance.toFixed(4)}`);
             } else {
                 results.push({
                     studentId: null,
@@ -513,6 +533,7 @@ app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
                     age: null,
                     gender: null
                 });
+                console.log(`❌ Không nhận diện được khuôn mặt #${i}`);
             }
         }
 
@@ -520,16 +541,14 @@ app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
             updateAttendance(id);
             const result = results.find(r => r.studentId === id);
             if (result) {
-                // Log cảm xúc khi thay đổi
                 if (lastEmotion[id] !== result.emotion) {
                     logEvent(id, result.studentName, 'emotion', {
                         emotion: result.emotion,
                         age: result.age,
                         gender: result.gender
-                    });
+                    }, result.age, result.gender);
                     lastEmotion[id] = result.emotion;
                 }
-                // Lưu ảnh crop và cập nhật descriptor
                 if (croppedImages && croppedImages[idx]) {
                     const folder = ensureStudentFolder(id);
                     const base64Data = croppedImages[idx].replace(/^data:image\/jpeg;base64,/, '');
@@ -538,7 +557,7 @@ app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
                         Buffer.from(base64Data, 'base64')
                     );
                     limitCroppedImages(id, 10);
-                    saveStudentDescriptor(id, result.studentName, descriptors[idx]);
+                    saveStudentDescriptor(id, result.studentName, descriptors[idx], result.gender, result.age);
                 }
             }
         });
@@ -563,10 +582,11 @@ app.get('/api/attendance', (req, res) => {
     }
 });
 
-// 4. Danh sách học sinh
-app.get('/api/students', (req, res) => {
+// 4. Danh sách học sinh (có gender)
+app.get('/api/students', async (req, res) => {
     try {
-        res.json(loadAllStudentDescriptors().map(s => ({ id: s.id, name: s.name })));
+        const students = await getStudentsWithGender();
+        res.json(students);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -687,12 +707,11 @@ app.get('/api/emotion/class', async (req, res) => {
 // Debug
 app.get('/api/debug/students', (req, res) => {
     const all = loadAllStudentDescriptors();
-    res.json({ count: all.length, students: all.map(s => ({ id: s.id, name: s.name, descriptors: s.descriptors?.length || 0 })) });
+    res.json({ count: all.length, students: all.map(s => ({ id: s.id, name: s.name, descriptors: s.descriptors?.length || 0, gender: s.gender || null, age: s.age || null })) });
 });
 
 // ==================== PART 5: DASHBOARD & REPORT APIs ====================
 
-// Dashboard stats (tổng hợp)
 app.get('/api/stats', async (req, res) => {
     try {
         const stats = await getStats();
@@ -702,7 +721,6 @@ app.get('/api/stats', async (req, res) => {
     }
 });
 
-// Weekly report data cho biểu đồ
 app.get('/api/report/week/:date', async (req, res) => {
     try {
         const { date } = req.params;
@@ -723,7 +741,6 @@ app.get('/api/report/week/:date', async (req, res) => {
     }
 });
 
-// Behavior events today
 app.get('/api/behavior/today', async (req, res) => {
     try {
         const { db } = require('./db');
@@ -741,7 +758,10 @@ app.get('/api/behavior/today', async (req, res) => {
     }
 });
 
-// PDF Report
+let PDFDocument, ExcelJS;
+try { PDFDocument = require('pdfkit'); } catch (e) {}
+try { ExcelJS = require('exceljs'); } catch (e) {}
+
 app.get('/api/report/pdf', async (req, res) => {
     if (!PDFDocument) {
         return res.status(503).json({ error: 'pdfkit chưa được cài. Chạy: npm install pdfkit' });
@@ -758,12 +778,10 @@ app.get('/api/report/pdf', async (req, res) => {
         res.setHeader('Content-Disposition', `attachment; filename="baocao_${today}.pdf"`);
         doc.pipe(res);
 
-        // Header
         doc.fontSize(18).font('Helvetica-Bold').text('BÁO CÁO ĐIỂM DANH', { align: 'center' });
         doc.fontSize(12).font('Helvetica').text(`Ngày: ${today}`, { align: 'center' });
         doc.moveDown();
 
-        // Stats
         doc.fontSize(13).font('Helvetica-Bold').text('THỐNG KÊ TỔNG QUAN');
         doc.fontSize(11).font('Helvetica');
         doc.text(`Tổng học sinh: ${stats.totalStudents}`);
@@ -772,7 +790,6 @@ app.get('/api/report/pdf', async (req, res) => {
         doc.text(`Tỷ lệ: ${stats.totalStudents > 0 ? Math.round(stats.presentToday / stats.totalStudents * 100) : 0}%`);
         doc.moveDown();
 
-        // Present table
         doc.fontSize(13).font('Helvetica-Bold').text('DANH SÁCH CÓ MẶT');
         doc.fontSize(10).font('Helvetica');
         const present = allStudents.filter(s => presentIds.has(s.id));
@@ -786,7 +803,6 @@ app.get('/api/report/pdf', async (req, res) => {
         }
         doc.moveDown();
 
-        // Absent table
         doc.fontSize(13).font('Helvetica-Bold').text('DANH SÁCH VẮNG MẶT');
         doc.fontSize(10).font('Helvetica');
         const absent = allStudents.filter(s => !presentIds.has(s.id));
@@ -805,7 +821,6 @@ app.get('/api/report/pdf', async (req, res) => {
     }
 });
 
-// Excel Report
 app.get('/api/report/excel', async (req, res) => {
     if (!ExcelJS) {
         return res.status(503).json({ error: 'exceljs chưa được cài. Chạy: npm install exceljs' });
@@ -822,7 +837,6 @@ app.get('/api/report/excel', async (req, res) => {
         workbook.creator = 'Smart Classroom Monitor';
         const sheet = workbook.addWorksheet(`Điểm danh ${today}`);
 
-        // Header row
         sheet.columns = [
             { header: 'STT', key: 'stt', width: 8 },
             { header: 'Mã học sinh', key: 'id', width: 15 },
@@ -831,14 +845,12 @@ app.get('/api/report/excel', async (req, res) => {
             { header: 'Thời gian điểm danh', key: 'time', width: 22 }
         ];
 
-        // Style header
         sheet.getRow(1).eachCell(cell => {
             cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
             cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A2E' } };
             cell.alignment = { horizontal: 'center' };
         });
 
-        // Data rows
         allStudents.forEach((s, i) => {
             const isPresent = presentIds.has(s.id);
             const row = sheet.addRow({
@@ -854,7 +866,6 @@ app.get('/api/report/excel', async (req, res) => {
             }
         });
 
-        // Summary
         sheet.addRow([]);
         const stats = await getStats();
         sheet.addRow(['', '', 'Tổng cộng:', allStudents.length, '']);
@@ -871,31 +882,98 @@ app.get('/api/report/excel', async (req, res) => {
     }
 });
 
-// ==================== PART 6: GOOGLE SHEETS ====================
-
-app.post('/api/sheets/export', async (req, res) => {
-    if (!sheetsService) {
-        return res.status(503).json({ error: 'Google Sheets service chưa cấu hình. Cài googleapis và tạo services/googleSheets.js' });
-    }
-    if (!process.env.GOOGLE_SHEETS_SPREADSHEET_ID) {
-        return res.status(503).json({ error: 'Thiếu GOOGLE_SHEETS_SPREADSHEET_ID trong .env' });
-    }
+app.get('/api/report/csv', async (req, res) => {
     try {
-        const allStudents = loadAllStudentDescriptors().map(s => ({ id: s.id, name: s.name }));
+        const allStudents = loadAllStudentDescriptors();
         const today = new Date().toISOString().slice(0, 10);
-        const attendance = await getTodayAttendance();
-        const result = await sheetsService.exportAttendanceToSheets(allStudents, attendance, today);
-        res.json({ success: true, url: result.url, sheetName: result.sheetName, rows: result.rows });
+        const todayAttendance = await getTodayAttendance();
+        const presentIds = new Set(todayAttendance.map(a => a.studentId));
+        const presentMap = {};
+        todayAttendance.forEach(a => { presentMap[a.studentId] = a.timestamp; });
+
+        const headers = ['STT', 'Mã học sinh', 'Họ tên', 'Trạng thái', 'Thời gian điểm danh'];
+        const rows = allStudents.map((s, i) => [
+            i + 1,
+            s.id,
+            s.name,
+            presentIds.has(s.id) ? 'Có mặt' : 'Vắng mặt',
+            presentMap[s.id] || ''
+        ]);
+
+        const stats = await getStats();
+        const summary = [
+            [],
+            ['TỔNG KẾT'],
+            ['Tổng học sinh:', allStudents.length],
+            ['Có mặt:', stats.presentToday],
+            ['Vắng mặt:', stats.totalStudents - stats.presentToday],
+            ['Tỷ lệ:', stats.totalStudents > 0 ? (stats.presentToday / stats.totalStudents * 100).toFixed(1) + '%' : '0%']
+        ];
+
+        const csvContent = [
+            headers.join(','),
+            ...rows.map(row => row.join(',')),
+            ...summary.map(row => row.join(','))
+        ].join('\n');
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="diemdanh_${today}.csv"`);
+        res.send('\uFEFF' + csvContent);
     } catch (err) {
-        console.error('Sheets export error:', err);
+        console.error('CSV export error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-app.get('/api/sheets/link', (req, res) => {
-    const id = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
-    if (!id) return res.status(503).json({ error: 'Chưa cấu hình Google Sheets' });
-    res.json({ success: true, url: `https://docs.google.com/spreadsheets/d/${id}` });
+app.get('/api/report/week-csv/:date', async (req, res) => {
+    try {
+        const { date } = req.params;
+        const allStudents = loadAllStudentDescriptors();
+        const total = allStudents.length;
+        const { db } = require('./db');
+
+        const startDate = new Date(date);
+        startDate.setDate(startDate.getDate() - 6);
+        const weekData = [];
+        for (let i = 0; i < 7; i++) {
+            const d = new Date(startDate);
+            d.setDate(d.getDate() + i);
+            const dateStr = d.toISOString().slice(0, 10);
+            const present = await new Promise((resolve, reject) => {
+                db.get(`
+                    SELECT COUNT(DISTINCT studentId) as count FROM events
+                    WHERE date(timestamp) = ? AND action = 'attendance'
+                `, [dateStr], (err, row) => err ? reject(err) : resolve(row?.count || 0));
+            });
+            weekData.push({
+                date: dateStr,
+                total,
+                present,
+                absent: total - present
+            });
+        }
+
+        const headers = ['Ngày', 'Tổng học sinh', 'Có mặt', 'Vắng mặt', 'Tỷ lệ (%)'];
+        const rows = weekData.map(d => [
+            d.date,
+            d.total,
+            d.present,
+            d.absent,
+            d.total > 0 ? (d.present / d.total * 100).toFixed(1) : '0'
+        ]);
+
+        const csvContent = [
+            headers.join(','),
+            ...rows.map(row => row.join(','))
+        ].join('\n');
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="baocao_tuan_${date}.csv"`);
+        res.send('\uFEFF' + csvContent);
+    } catch (err) {
+        console.error('CSV weekly export error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ==================== KHỞI ĐỘNG ====================
