@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dashboard - Giám sát lớp học</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: #f0f2f5;
+            color: #1a1a2e;
+        }
+
+        header {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: white;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        header h1 { font-size: 1.3rem; font-weight: 700; }
+        header .subtitle { font-size: 0.8rem; opacity: 0.7; margin-top: 2px; }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        #refresh-badge {
+            background: rgba(255,255,255,0.15);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.78rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        #refresh-dot {
+            width: 8px; height: 8px;
+            background: #4caf50;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-primary { background: #e94560; color: white; }
+        .btn-primary:hover { background: #c73652; transform: translateY(-1px); }
+        .btn-secondary { background: rgba(255,255,255,0.15); color: white; }
+        .btn-secondary:hover { background: rgba(255,255,255,0.25); }
+        .btn-success { background: #4caf50; color: white; }
+        .btn-success:hover { background: #388e3c; }
+
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+        /* STAT CARDS */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: white;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .stat-card:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.1); }
+
+        .stat-icon {
+            width: 52px; height: 52px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.6rem;
+            flex-shrink: 0;
+        }
+
+        .icon-blue { background: #e3f2fd; }
+        .icon-green { background: #e8f5e9; }
+        .icon-red { background: #ffebee; }
+        .icon-orange { background: #fff3e0; }
+        .icon-purple { background: #f3e5f5; }
+
+        .stat-info .value {
+            font-size: 2rem;
+            font-weight: 800;
+            line-height: 1;
+            color: #1a1a2e;
+        }
+
+        .stat-info .label {
+            font-size: 0.78rem;
+            color: #888;
+            margin-top: 4px;
+        }
+
+        /* CHARTS GRID */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .card-title {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #1a1a2e;
+        }
+
+        .card-badge {
+            background: #f0f2f5;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            color: #666;
+        }
+
+        .chart-wrapper { position: relative; height: 240px; }
+
+        /* TABLES */
+        .tables-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        table { width: 100%; border-collapse: collapse; }
+
+        th {
+            background: #f8f9fa;
+            padding: 10px 14px;
+            text-align: left;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            padding: 10px 14px;
+            border-bottom: 1px solid #f0f2f5;
+            font-size: 0.88rem;
+            color: #333;
+        }
+
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: #fafbfc; }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-green { background: #e8f5e9; color: #2e7d32; }
+        .badge-red { background: #ffebee; color: #c62828; }
+        .badge-orange { background: #fff3e0; color: #e65100; }
+        .badge-blue { background: #e3f2fd; color: #1565c0; }
+
+        /* BEHAVIOR LOG */
+        #behavior-feed {
+            max-height: 280px;
+            overflow-y: auto;
+        }
+
+        .behavior-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            padding: 10px 0;
+            border-bottom: 1px solid #f0f2f5;
+        }
+
+        .behavior-item:last-child { border-bottom: none; }
+
+        .behavior-dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            margin-top: 5px;
+            flex-shrink: 0;
+        }
+
+        .dot-red { background: #e94560; }
+        .dot-orange { background: #ff9800; }
+        .dot-blue { background: #2196f3; }
+
+        .behavior-text { font-size: 0.85rem; }
+        .behavior-text .name { font-weight: 600; color: #1a1a2e; }
+        .behavior-text .time { font-size: 0.75rem; color: #999; margin-top: 2px; }
+
+        /* ACTION BAR */
+        .action-bar {
+            background: white;
+            border-radius: 16px;
+            padding: 16px 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+
+        .action-bar .label { font-size: 0.88rem; font-weight: 600; color: #555; margin-right: 4px; }
+
+        /* PROGRESS BAR */
+        .progress-bar {
+            background: #f0f2f5;
+            border-radius: 8px;
+            height: 8px;
+            overflow: hidden;
+            margin-top: 6px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            border-radius: 8px;
+            transition: width 0.5s ease;
+        }
+
+        /* LOADING */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        /* TOAST */
+        #toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1a1a2e;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-size: 0.88rem;
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 999;
+            pointer-events: none;
+        }
+
+        #toast.show { opacity: 1; }
+
+        /* RESPONSIVE */
+        @media (max-width: 768px) {
+            .charts-grid { grid-template-columns: 1fr; }
+            .tables-grid { grid-template-columns: 1fr; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            header h1 { font-size: 1rem; }
+        }
+
+        @media (max-width: 480px) {
+            .stats-grid { grid-template-columns: 1fr; }
+            .container { padding: 12px; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div>
+        <h1>📊 Dashboard Giám sát lớp học</h1>
+        <div class="subtitle" id="date-label">Đang tải...</div>
+    </div>
+    <div class="header-right">
+        <div id="refresh-badge">
+            <div id="refresh-dot"></div>
+            <span id="refresh-countdown">Cập nhật sau 30s</span>
+        </div>
+        <a href="/" class="btn btn-secondary">🎥 Màn hình chính</a>
+    </div>
+</header>
+
+<div class="container">
+
+    <!-- ACTION BAR -->
+    <div class="action-bar">
+        <span class="label">Hành động:</span>
+        <button class="btn btn-primary" onclick="sendReport()">📤 Gửi báo cáo Telegram</button>
+        <button class="btn btn-success" onclick="exportPDF()">📄 Xuất PDF</button>
+        <button class="btn btn-success" onclick="exportSheets()">📊 Xuất Google Sheets</button>
+        <button class="btn btn-secondary" style="background:#e3f2fd;color:#1565c0;" onclick="exportExcel()">📥 Xuất Excel</button>
+        <button class="btn btn-secondary" style="background:#f5f5f5;color:#333;" onclick="loadAll()">🔄 Làm mới ngay</button>
+    </div>
+
+    <!-- STAT CARDS -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-icon icon-blue">👥</div>
+            <div class="stat-info">
+                <div class="value" id="stat-total">--</div>
+                <div class="label">Tổng học sinh</div>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon icon-green">✅</div>
+            <div class="stat-info">
+                <div class="value" id="stat-present">--</div>
+                <div class="label">Có mặt hôm nay</div>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon icon-red">❌</div>
+            <div class="stat-info">
+                <div class="value" id="stat-absent">--</div>
+                <div class="label">Vắng mặt</div>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon icon-orange">📈</div>
+            <div class="stat-info">
+                <div class="value" id="stat-rate">--%</div>
+                <div class="label">Tỷ lệ có mặt</div>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon icon-purple">😊</div>
+            <div class="stat-info">
+                <div class="value" id="stat-emotion">--</div>
+                <div class="label">Cảm xúc chủ đạo</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- CHARTS -->
+    <div class="charts-grid">
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">😊 Phân bố cảm xúc hôm nay</span>
+                <span class="card-badge" id="emotion-total-badge">0 lượt</span>
+            </div>
+            <div class="chart-wrapper">
+                <canvas id="emotionChart"></canvas>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">📅 Điểm danh 7 ngày gần đây</span>
+                <span class="card-badge">Tuần này</span>
+            </div>
+            <div class="chart-wrapper">
+                <canvas id="weeklyChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- TABLES -->
+    <div class="tables-grid">
+        <!-- Present students -->
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">✅ Học sinh có mặt</span>
+                <span class="card-badge" id="present-badge">0 học sinh</span>
+            </div>
+            <div id="present-table-wrap">
+                <div class="loading">Đang tải...</div>
+            </div>
+        </div>
+
+        <!-- Absent students -->
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">❌ Học sinh vắng mặt</span>
+                <span class="card-badge" id="absent-badge">0 học sinh</span>
+            </div>
+            <div id="absent-table-wrap">
+                <div class="loading">Đang tải...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- BEHAVIOR LOG -->
+    <div class="card" style="margin-bottom:24px;">
+        <div class="card-header">
+            <span class="card-title">🚨 Nhật ký hành vi hôm nay</span>
+            <span class="card-badge" id="behavior-badge">0 sự kiện</span>
+        </div>
+        <div id="behavior-feed">
+            <div class="loading">Đang tải...</div>
+        </div>
+    </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>

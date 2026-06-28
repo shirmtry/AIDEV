@@ -7,8 +7,36 @@ const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 const { logEvent, registerStudent, getTodayAttendance, getStudentAttendance, getStats, getVietnamTime } = require('./db');
 
+// Part 5 & 6: Optional dependencies (graceful fallback if not installed)
+let PDFDocument = null;
+let ExcelJS = null;
+let sheetsService = null;
+
+try { PDFDocument = require('pdfkit'); } catch (e) { console.warn('⚠️ pdfkit chưa cài: npm install pdfkit'); }
+try { ExcelJS = require('exceljs'); } catch (e) { console.warn('⚠️ exceljs chưa cài: npm install exceljs'); }
+try { sheetsService = require('./services/googleSheets'); } catch (e) { console.warn('⚠️ Google Sheets service chưa sẵn sàng'); }
+
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// ==================== RATE LIMITING (Part 4) ====================
+const requestCounts = {}; // { 'ip:endpoint': { count, resetAt } }
+
+function rateLimit(maxRequests, windowMs) {
+    return (req, res, next) => {
+        const key = `${req.ip}:${req.path}`;
+        const now = Date.now();
+        if (!requestCounts[key] || now > requestCounts[key].resetAt) {
+            requestCounts[key] = { count: 1, resetAt: now + windowMs };
+            return next();
+        }
+        requestCounts[key].count++;
+        if (requestCounts[key].count > maxRequests) {
+            return res.status(429).json({ error: 'Quá nhiều yêu cầu, vui lòng thử lại sau.' });
+        }
+        next();
+    };
+}
 
 // Middleware
 app.use(cors());
@@ -24,6 +52,10 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, '../frontend/index.html'));
 });
 
+app.get('/dashboard', (req, res) => {
+    res.sendFile(path.join(__dirname, '../frontend/dashboard.html'));
+});
+
 // ==================== TELEGRAM BOT ====================
 let bot = null;
 if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_token_here') {
@@ -32,18 +64,19 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
         console.log('✅ Telegram Bot đã kết nối');
         console.log('📌 Chat ID mục tiêu:', process.env.TELEGRAM_CHAT_ID || 'CHƯA CẤU HÌNH');
 
-        // ---- LỆNH BOT ----
         bot.onText(/\/start/, (msg) => {
             bot.sendMessage(msg.chat.id, '🤖 Bot giám sát lớp học đã sẵn sàng!');
         });
 
         bot.onText(/\/help/, (msg) => {
-            bot.sendMessage(msg.chat.id, 
+            bot.sendMessage(msg.chat.id,
                 '📋 *Các lệnh:*\n' +
                 '/today - Xem điểm danh hôm nay\n' +
                 '/stats - Thống kê tổng quan\n' +
                 '/student <id> - Xem lịch sử học sinh\n' +
-                '/report - Gửi báo cáo ngay (nếu đang trong giờ học)',
+                '/emotion <id> - Xem cảm xúc học sinh hôm nay\n' +
+                '/classemotion - Tổng hợp cảm xúc lớp hôm nay\n' +
+                '/report - Gửi báo cáo ngay',
                 { parse_mode: 'Markdown' }
             );
         });
@@ -63,7 +96,6 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
-                console.error(err);
             }
         });
 
@@ -78,7 +110,6 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
-                console.error(err);
             }
         });
 
@@ -95,15 +126,55 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 rows.slice(0, 10).forEach((r, i) => {
                     const detail = r.details ? JSON.parse(r.details) : {};
                     let line = `${i+1}. ${r.action} ${r.timestamp}`;
-                    if (r.action === 'emotion' && detail.emotion) {
-                        line += ` 😊 ${detail.emotion}`;
-                    }
+                    if (r.action === 'emotion' && detail.emotion) line += ` 😊 ${detail.emotion}`;
                     message += line + '\n';
                 });
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
-                console.error(err);
+            }
+        });
+
+        // Part 3: Lệnh xem cảm xúc học sinh
+        bot.onText(/\/emotion (.+)/, async (msg, match) => {
+            const chatId = msg.chat.id;
+            const id = match[1].trim();
+            try {
+                const stats = await getEmotionStats(id);
+                if (!stats || stats.length === 0) {
+                    bot.sendMessage(chatId, `Không có dữ liệu cảm xúc cho học sinh ${id} hôm nay.`);
+                    return;
+                }
+                let message = `😊 *Cảm xúc học sinh ${id} hôm nay:*\n\n`;
+                stats.forEach(s => {
+                    const bar = '▓'.repeat(Math.round(s.count / stats.reduce((a, b) => a + b.count, 0) * 10));
+                    message += `${s.emotion}: ${bar} (${s.count} lần)\n`;
+                });
+                bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            } catch (err) {
+                bot.sendMessage(chatId, '❌ Lỗi truy vấn');
+            }
+        });
+
+        // Part 3: Lệnh xem cảm xúc toàn lớp
+        bot.onText(/\/classemotion/, async (msg) => {
+            const chatId = msg.chat.id;
+            try {
+                const stats = await getClassEmotionStats();
+                if (!stats || stats.length === 0) {
+                    bot.sendMessage(chatId, 'Chưa có dữ liệu cảm xúc lớp hôm nay.');
+                    return;
+                }
+                let message = `😊 *Tổng hợp cảm xúc lớp hôm nay:*\n\n`;
+                const total = stats.reduce((a, b) => a + b.count, 0);
+                stats.forEach(s => {
+                    const pct = Math.round(s.count / total * 100);
+                    const bar = '▓'.repeat(Math.round(pct / 10));
+                    message += `${s.emotion}: ${bar} ${pct}% (${s.count} lần)\n`;
+                });
+                bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+            } catch (err) {
+                bot.sendMessage(chatId, '❌ Lỗi truy vấn');
             }
         });
 
@@ -114,8 +185,15 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, '✅ Đã gửi báo cáo điểm danh.');
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi gửi báo cáo');
-                console.error(err);
             }
+        });
+
+        bot.onText(/\/dashboard/, (msg) => {
+            const host = process.env.SERVER_HOST || `http://localhost:${PORT}`;
+            bot.sendMessage(msg.chat.id,
+                `📊 *Dashboard giám sát lớp học*\n\n🔗 ${host}/dashboard`,
+                { parse_mode: 'Markdown' }
+            );
         });
 
     } catch (err) {
@@ -130,26 +208,16 @@ const DESCRIPTORS_FILE = path.join(__dirname, 'database', 'descriptors.json');
 const STUDENT_DATA_DIR = path.join(__dirname, 'database', 'student_data');
 const CROPPED_FACES_DIR = path.join(__dirname, 'database', 'cropped_faces');
 
-if (!fs.existsSync(path.join(__dirname, 'database'))) {
-    fs.mkdirSync(path.join(__dirname, 'database'), { recursive: true });
-}
-if (!fs.existsSync(STUDENT_DATA_DIR)) {
-    fs.mkdirSync(STUDENT_DATA_DIR, { recursive: true });
-}
-if (!fs.existsSync(CROPPED_FACES_DIR)) {
-    fs.mkdirSync(CROPPED_FACES_DIR, { recursive: true });
-}
-if (!fs.existsSync(DESCRIPTORS_FILE)) {
-    fs.writeFileSync(DESCRIPTORS_FILE, JSON.stringify([]));
-}
+[path.join(__dirname, 'database'), STUDENT_DATA_DIR, CROPPED_FACES_DIR].forEach(dir => {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+if (!fs.existsSync(DESCRIPTORS_FILE)) fs.writeFileSync(DESCRIPTORS_FILE, JSON.stringify([]));
 
 // ==================== HÀM ĐỌC/GHI DESCRIPTORS ====================
 function loadDescriptors() {
     try {
-        const data = fs.readFileSync(DESCRIPTORS_FILE, 'utf8');
-        return JSON.parse(data);
+        return JSON.parse(fs.readFileSync(DESCRIPTORS_FILE, 'utf8'));
     } catch (err) {
-        console.error('Lỗi đọc descriptors:', err);
         return [];
     }
 }
@@ -164,108 +232,70 @@ function getStudentFolder(studentId) {
 
 function ensureStudentFolder(studentId) {
     const folder = getStudentFolder(studentId);
-    if (!fs.existsSync(folder)) {
-        fs.mkdirSync(folder, { recursive: true });
-    }
+    if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
     return folder;
 }
 
-// Lưu descriptor mới (hỗ trợ nhiều descriptors)
 function saveStudentDescriptor(studentId, name, descriptor) {
     const folder = ensureStudentFolder(studentId);
     const filePath = path.join(folder, 'descriptor.json');
     let data = { id: studentId, name, descriptors: [] };
-    
     if (fs.existsSync(filePath)) {
-        try {
-            const existing = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-            data = existing;
-        } catch (err) {
-            console.warn(`⚠️ Lỗi đọc descriptor của ${studentId}, tạo mới`);
-        }
+        try { data = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (e) {}
     }
-    
     if (!data.descriptors) data.descriptors = [];
     data.descriptors.push(descriptor);
-    // Giữ tối đa 20 descriptors để tránh phình to
-    if (data.descriptors.length > 20) {
-        data.descriptors = data.descriptors.slice(-20);
-    }
+    if (data.descriptors.length > 20) data.descriptors = data.descriptors.slice(-20);
     data.name = name;
-    
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-    
-    // Cập nhật descriptors.json để tương thích ngược
+
     const descriptors = loadDescriptors();
     const existing = descriptors.find(s => s.id === studentId);
-    if (existing) {
-        existing.name = name;
-        existing.descriptors = data.descriptors;
-    } else {
-        descriptors.push({ id: studentId, name, descriptors: data.descriptors });
-    }
+    if (existing) { existing.name = name; existing.descriptors = data.descriptors; }
+    else descriptors.push({ id: studentId, name, descriptors: data.descriptors });
     saveDescriptors(descriptors);
 }
 
-// Load tất cả học sinh (từ thư mục student_data)
 function loadAllStudentDescriptors() {
     const allStudents = [];
     if (fs.existsSync(STUDENT_DATA_DIR)) {
-        const folders = fs.readdirSync(STUDENT_DATA_DIR).filter(f => {
-            const stat = fs.statSync(path.join(STUDENT_DATA_DIR, f));
-            return stat.isDirectory();
-        });
+        const folders = fs.readdirSync(STUDENT_DATA_DIR).filter(f =>
+            fs.statSync(path.join(STUDENT_DATA_DIR, f)).isDirectory()
+        );
         for (const folder of folders) {
             const descFile = path.join(STUDENT_DATA_DIR, folder, 'descriptor.json');
             if (fs.existsSync(descFile)) {
-                try {
-                    const data = JSON.parse(fs.readFileSync(descFile, 'utf8'));
-                    allStudents.push(data);
-                } catch (err) {
-                    console.warn(`⚠️ Lỗi đọc descriptor của ${folder}:`, err.message);
-                }
-            } else {
-                console.warn(`⚠️ Không tìm thấy descriptor.json trong thư mục ${folder}`);
+                try { allStudents.push(JSON.parse(fs.readFileSync(descFile, 'utf8'))); }
+                catch (e) { console.warn(`⚠️ Lỗi đọc descriptor ${folder}`); }
             }
         }
     }
-    // Chỉ log khi có thay đổi (không log mỗi lần gọi)
     return allStudents;
 }
 
-// ==================== HÀM SO SÁNH (giảm threshold xuống 0.6) ====================
+// ==================== SO SÁNH DESCRIPTOR ====================
 function euclideanDistance(arr1, arr2) {
     if (!arr1 || !arr2 || arr1.length !== arr2.length) return Infinity;
     let sum = 0;
-    for (let i = 0; i < arr1.length; i++) {
-        sum += Math.pow(arr1[i] - arr2[i], 2);
-    }
+    for (let i = 0; i < arr1.length; i++) sum += (arr1[i] - arr2[i]) ** 2;
     return Math.sqrt(sum);
 }
 
 function findBestMatch(descriptor, threshold = 0.6) {
     let allStudents = loadAllStudentDescriptors();
     if (allStudents.length === 0) allStudents = loadDescriptors();
-    
-    let bestMatch = null;
-    let bestDistance = Infinity;
+    let bestMatch = null, bestDistance = Infinity;
     for (const student of allStudents) {
-        const descriptors = student.descriptors || [student.descriptor];
-        for (const desc of descriptors) {
+        const descs = student.descriptors || [student.descriptor];
+        for (const desc of descs) {
             const dist = euclideanDistance(descriptor, desc);
-            if (dist < bestDistance) {
-                bestDistance = dist;
-                bestMatch = student;
-            }
+            if (dist < bestDistance) { bestDistance = dist; bestMatch = student; }
         }
     }
-    if (bestMatch && bestDistance < threshold) {
-        return { student: bestMatch, distance: bestDistance };
-    }
-    return null;
+    return bestMatch && bestDistance < threshold ? { student: bestMatch, distance: bestDistance } : null;
 }
 
-// ==================== LƯU ĐIỂM DANH + LOG ====================
+// ==================== ĐIỂM DANH ====================
 let attendance = {};
 let attendanceTimestamps = {};
 const currentSession = new Date().toISOString().slice(0, 10);
@@ -274,14 +304,46 @@ function updateAttendance(studentId) {
     if (!attendance[currentSession]) attendance[currentSession] = [];
     if (!attendance[currentSession].includes(studentId)) {
         attendance[currentSession].push(studentId);
-        if (!attendanceTimestamps[currentSession]) {
-            attendanceTimestamps[currentSession] = {};
-        }
-        const vietnamTime = getVietnamTime();
-        attendanceTimestamps[currentSession][studentId] = vietnamTime;
+        if (!attendanceTimestamps[currentSession]) attendanceTimestamps[currentSession] = {};
+        attendanceTimestamps[currentSession][studentId] = getVietnamTime();
         const student = loadAllStudentDescriptors().find(s => s.id === studentId);
         logEvent(studentId, student ? student.name : studentId, 'attendance', {});
     }
+}
+
+// ==================== EMOTION STATS (Part 3) ====================
+const { db } = require('./db');
+
+function getEmotionStats(studentId) {
+    return new Promise((resolve, reject) => {
+        const today = new Date().toISOString().slice(0, 10);
+        db.all(`
+            SELECT json_extract(details, '$.emotion') as emotion, COUNT(*) as count
+            FROM events
+            WHERE studentId = ? AND action = 'emotion' AND date(timestamp) = ?
+            GROUP BY emotion
+            ORDER BY count DESC
+        `, [studentId, today], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+function getClassEmotionStats() {
+    return new Promise((resolve, reject) => {
+        const today = new Date().toISOString().slice(0, 10);
+        db.all(`
+            SELECT json_extract(details, '$.emotion') as emotion, COUNT(*) as count
+            FROM events
+            WHERE action = 'emotion' AND date(timestamp) = ?
+            GROUP BY emotion
+            ORDER BY count DESC
+        `, [today], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
 }
 
 // ==================== CA HỌC & BÁO CÁO ====================
@@ -308,86 +370,60 @@ const STUDY_SESSIONS = [
 function getCurrentSession() {
     const now = new Date();
     const timeStr = now.toTimeString().slice(0, 5);
-    for (const session of STUDY_SESSIONS) {
-        if (timeStr >= session.start && timeStr < session.end) {
-            return session;
-        }
-    }
-    return null;
+    return STUDY_SESSIONS.find(s => timeStr >= s.start && timeStr < s.end) || null;
 }
 
 let lastReportState = null;
 
 async function sendAttendanceReport(force = false) {
-    console.log('📤 sendAttendanceReport called, force:', force);
-    if (!bot) {
-        console.log('⚠️ Bot chưa kết nối, không gửi báo cáo');
-        return;
-    }
+    if (!bot) return;
     const session = getCurrentSession();
-    if (!session) {
-        console.log('⏰ Không trong giờ học, bỏ qua báo cáo');
-        return;
-    }
+    if (!session) { console.log('⏰ Không trong giờ học'); return; }
     const allStudents = loadAllStudentDescriptors();
-    if (allStudents.length === 0) {
-        console.log('⚠️ Chưa có học sinh nào được đăng ký');
-        return;
-    }
+    if (allStudents.length === 0) return;
     const present = attendance[currentSession] || [];
     const presentIds = present.slice().sort();
 
-    if (!force && lastReportState && lastReportState.sessionName === session.name &&
+    if (!force && lastReportState &&
+        lastReportState.sessionName === session.name &&
         JSON.stringify(lastReportState.presentIds) === JSON.stringify(presentIds)) {
-        console.log('⏭️ Không có thay đổi, bỏ qua gửi báo cáo');
         return;
     }
 
     const presentSet = new Set(present);
     const absent = allStudents.filter(s => !presentSet.has(s.id));
-
     let message = `📊 *BÁO CÁO ĐIỂM DANH CA ${session.name.toUpperCase()}*\n`;
-    message += `📅 Ngày: ${currentSession}\n`;
-    message += `⏰ ${session.start} - ${session.end}\n\n`;
+    message += `📅 Ngày: ${currentSession}\n⏰ ${session.start} - ${session.end}\n\n`;
     message += `✅ *Có mặt (${present.length}/${allStudents.length}):*\n`;
     if (present.length > 0) {
-        const presentStudents = allStudents.filter(s => presentSet.has(s.id));
-        message += presentStudents.map((s, i) => `${i+1}. ${s.name}`).join('\n');
+        message += allStudents.filter(s => presentSet.has(s.id)).map((s, i) => `${i+1}. ${s.name}`).join('\n');
     } else {
         message += '❌ Không có học sinh nào điểm danh';
     }
     message += `\n\n❌ *Vắng mặt (${absent.length}):*\n`;
-    if (absent.length > 0) {
-        message += absent.map((s, i) => `${i+1}. ${s.name}`).join('\n');
-    } else {
-        message += '🎉 Tất cả đều có mặt!';
-    }
+    message += absent.length > 0 ? absent.map((s, i) => `${i+1}. ${s.name}`).join('\n') : '🎉 Tất cả đều có mặt!';
 
     try {
         await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
-        console.log(`📨 Đã gửi báo cáo điểm danh ca ${session.name}`);
-        
-        // Gửi ảnh của học sinh đầu tiên có mặt
+        console.log(`📨 Đã gửi báo cáo ca ${session.name}`);
         if (present.length > 0) {
             const firstStudent = allStudents.find(s => presentSet.has(s.id));
             if (firstStudent) {
                 const folder = getStudentFolder(firstStudent.id);
-                const files = fs.readdirSync(folder).filter(f => f.endsWith('.jpg'));
-                if (files.length > 0) {
-                    const latestImage = path.join(folder, files[files.length - 1]);
-                    await bot.sendPhoto(process.env.TELEGRAM_CHAT_ID, latestImage, {
-                        caption: `📸 Ảnh điểm danh: ${firstStudent.name} (${firstStudent.id})`
-                    });
+                if (fs.existsSync(folder)) {
+                    const files = fs.readdirSync(folder).filter(f => f.endsWith('.jpg'));
+                    if (files.length > 0) {
+                        await bot.sendPhoto(process.env.TELEGRAM_CHAT_ID,
+                            path.join(folder, files[files.length - 1]),
+                            { caption: `📸 Ảnh điểm danh: ${firstStudent.name} (${firstStudent.id})` }
+                        );
+                    }
                 }
             }
         }
-        
         lastReportState = { sessionName: session.name, presentIds };
     } catch (err) {
         console.error('❌ Lỗi gửi báo cáo:', err.message);
-        if (err.response) {
-            console.error('Chi tiết lỗi Telegram:', err.response.body);
-        }
     }
 }
 
@@ -402,119 +438,107 @@ function scheduleReports() {
     }, 30000);
 }
 
-// ==================== HÀM GIỚI HẠN SỐ ẢNH CROP ====================
 function limitCroppedImages(studentId, maxCount = 10) {
     const folder = getStudentFolder(studentId);
     if (!fs.existsSync(folder)) return;
     const files = fs.readdirSync(folder).filter(f => f.endsWith('.jpg'));
     if (files.length <= maxCount) return;
-    // Sắp xếp theo thời gian sửa đổi (cũ nhất trước)
-    const sorted = files.sort((a, b) => {
-        return fs.statSync(path.join(folder, a)).mtimeMs - fs.statSync(path.join(folder, b)).mtimeMs;
-    });
-    const toDelete = sorted.slice(0, files.length - maxCount);
-    toDelete.forEach(file => {
+    const sorted = files.sort((a, b) =>
+        fs.statSync(path.join(folder, a)).mtimeMs - fs.statSync(path.join(folder, b)).mtimeMs
+    );
+    sorted.slice(0, files.length - maxCount).forEach(file => {
         fs.unlinkSync(path.join(folder, file));
-        console.log(`🗑️ Đã xóa ảnh cũ: ${file}`);
     });
 }
 
 // ==================== API ENDPOINTS ====================
 
 // 1. Đăng ký học sinh
-app.post('/api/register', (req, res) => {
+app.post('/api/register', rateLimit(10, 60000), (req, res) => {
     try {
         const { studentId, name, descriptor, croppedImage } = req.body;
-        if (!studentId || !name || !descriptor) {
-            return res.status(400).json({ error: 'Thiếu thông tin' });
-        }
+        if (!studentId || !name || !descriptor) return res.status(400).json({ error: 'Thiếu thông tin' });
         if (!Array.isArray(descriptor) || descriptor.length !== 128) {
             return res.status(400).json({ error: 'Descriptor phải là mảng 128 số' });
         }
-        const allStudents = loadAllStudentDescriptors();
-        if (allStudents.find(s => s.id === studentId)) {
+        if (loadAllStudentDescriptors().find(s => s.id === studentId)) {
             return res.status(400).json({ error: `Học sinh ${studentId} đã tồn tại` });
         }
         saveStudentDescriptor(studentId, name, descriptor);
         registerStudent(studentId, name);
-        
         if (croppedImage) {
             const folder = ensureStudentFolder(studentId);
-            const filename = `${studentId}_${Date.now()}.jpg`;
-            const filePath = path.join(folder, filename);
             const base64Data = croppedImage.replace(/^data:image\/jpeg;base64,/, '');
-            fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-            console.log(`📸 Đã lưu ảnh crop: ${filename}`);
-            // Giới hạn số ảnh
+            fs.writeFileSync(path.join(folder, `${studentId}_${Date.now()}.jpg`), Buffer.from(base64Data, 'base64'));
             limitCroppedImages(studentId, 10);
         }
-        
         res.json({ success: true, message: `Đã đăng ký ${name}` });
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 2. Nhận diện nhiều khuôn mặt (nhận cảm xúc + crop)
+// 2. Nhận diện nhiều khuôn mặt — hỗ trợ age/gender (Part 2)
 let lastEmotion = {};
 
-app.post('/api/recognize-multiple', (req, res) => {
+app.post('/api/recognize-multiple', rateLimit(100, 60000), (req, res) => {
     try {
-        const { descriptors, emotions, croppedImages } = req.body;
+        const { descriptors, emotions, croppedImages, ageGenders } = req.body;
         if (!descriptors || !Array.isArray(descriptors) || descriptors.length === 0) {
             return res.status(400).json({ error: 'Yêu cầu gửi mảng descriptors' });
         }
 
         const results = [];
         const recognizedIds = [];
+
         for (let i = 0; i < descriptors.length; i++) {
             const match = findBestMatch(descriptors[i]);
             if (match) {
                 const student = match.student;
                 recognizedIds.push(student.id);
-                // Log khoảng cách để debug
-                console.log(`🔍 Nhận diện: ${student.name} (distance: ${match.distance.toFixed(4)})`);
                 results.push({
                     studentId: student.id,
                     studentName: student.name,
                     distance: match.distance,
-                    emotion: emotions && emotions[i] ? emotions[i] : 'neutral'
+                    emotion: emotions && emotions[i] ? emotions[i] : 'neutral',
+                    age: ageGenders && ageGenders[i] ? ageGenders[i].age : null,
+                    gender: ageGenders && ageGenders[i] ? ageGenders[i].gender : null
                 });
             } else {
                 results.push({
                     studentId: null,
                     studentName: 'Unknown',
                     distance: null,
-                    emotion: emotions && emotions[i] ? emotions[i] : 'neutral'
+                    emotion: emotions && emotions[i] ? emotions[i] : 'neutral',
+                    age: null,
+                    gender: null
                 });
             }
         }
-        
+
         recognizedIds.forEach((id, idx) => {
             updateAttendance(id);
             const result = results.find(r => r.studentId === id);
             if (result) {
-                const emotion = result.emotion;
-                const last = lastEmotion[id];
-                if (last !== emotion) {
-                    logEvent(id, result.studentName, 'emotion', { emotion });
-                    lastEmotion[id] = emotion;
+                // Log cảm xúc khi thay đổi
+                if (lastEmotion[id] !== result.emotion) {
+                    logEvent(id, result.studentName, 'emotion', {
+                        emotion: result.emotion,
+                        age: result.age,
+                        gender: result.gender
+                    });
+                    lastEmotion[id] = result.emotion;
                 }
-                
-                // Lưu ảnh crop nếu có và giới hạn số ảnh
+                // Lưu ảnh crop và cập nhật descriptor
                 if (croppedImages && croppedImages[idx]) {
                     const folder = ensureStudentFolder(id);
-                    const filename = `${id}_${Date.now()}.jpg`;
-                    const filePath = path.join(folder, filename);
                     const base64Data = croppedImages[idx].replace(/^data:image\/jpeg;base64,/, '');
-                    fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
-                    console.log(`📸 Đã lưu ảnh crop: ${filename}`);
-                    // Giới hạn số ảnh
+                    fs.writeFileSync(
+                        path.join(folder, `${id}_${Date.now()}.jpg`),
+                        Buffer.from(base64Data, 'base64')
+                    );
                     limitCroppedImages(id, 10);
-                    
-                    const descriptor = descriptors[idx];
-                    saveStudentDescriptor(id, result.studentName, descriptor);
+                    saveStudentDescriptor(id, result.studentName, descriptors[idx]);
                 }
             }
         });
@@ -539,71 +563,55 @@ app.get('/api/attendance', (req, res) => {
     }
 });
 
-// 4. Lấy danh sách học sinh
+// 4. Danh sách học sinh
 app.get('/api/students', (req, res) => {
     try {
-        const all = loadAllStudentDescriptors();
-        res.json(all.map(s => ({ id: s.id, name: s.name })));
+        res.json(loadAllStudentDescriptors().map(s => ({ id: s.id, name: s.name })));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // 5. Cảnh báo hành vi
-app.post('/api/behavior', async (req, res) => {
+app.post('/api/behavior', rateLimit(50, 60000), async (req, res) => {
     try {
         const { studentId, behavior, timestamp } = req.body;
-        if (!studentId || !behavior) {
-            return res.status(400).json({ error: 'Thiếu studentId hoặc behavior' });
-        }
-        const all = loadAllStudentDescriptors();
-        const student = all.find(s => s.id === studentId);
-        if (!student) return res.status(404).json({ error: 'Không tìm thấy' });
+        if (!studentId || !behavior) return res.status(400).json({ error: 'Thiếu thông tin' });
+        const student = loadAllStudentDescriptors().find(s => s.id === studentId);
+        if (!student) return res.status(404).json({ error: 'Không tìm thấy học sinh' });
         logEvent(studentId, student.name, 'behavior', { behavior });
         if (!bot) return res.json({ success: false, message: 'Bot chưa kết nối' });
         const message = `🚨 *Cảnh báo hành vi!*\n\n` +
-                       `👤 Học sinh: ${student.name} (${student.id})\n` +
+                       `👤 ${student.name} (${student.id})\n` +
                        `⚠️ Hành vi: ${behavior}\n` +
-                       `🕐 Thời gian: ${timestamp || new Date().toLocaleString()}`;
+                       `🕐 ${timestamp || getVietnamTime()}`;
         await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
         res.json({ success: true });
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 6. Gửi báo cáo thủ công (POST)
+// 6 & 7. Gửi báo cáo thủ công
 app.post('/api/send-report', async (req, res) => {
-    try {
-        await sendAttendanceReport(true);
-        res.json({ success: true, message: 'Đã gửi báo cáo' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    try { await sendAttendanceReport(true); res.json({ success: true, message: 'Đã gửi báo cáo' }); }
+    catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. Gửi báo cáo thủ công (GET)
 app.get('/api/send-report', async (req, res) => {
-    try {
-        await sendAttendanceReport(true);
-        res.send('✅ Báo cáo đã được gửi qua Telegram!');
-    } catch (err) {
-        res.status(500).send('❌ Lỗi: ' + err.message);
-    }
+    try { await sendAttendanceReport(true); res.send('✅ Báo cáo đã được gửi qua Telegram!'); }
+    catch (err) { res.status(500).send('❌ Lỗi: ' + err.message); }
 });
 
-// 8. Xem lịch sử điểm danh của một học sinh (cũ)
+// 8. Lịch sử điểm danh học sinh
 app.get('/api/student/:id/attendance', (req, res) => {
     try {
         const studentId = req.params.id;
-        const all = loadAllStudentDescriptors();
-        const student = all.find(s => s.id === studentId);
+        const student = loadAllStudentDescriptors().find(s => s.id === studentId);
         if (!student) return res.status(404).json({ error: 'Không tìm thấy' });
-        const sessions = [];
-        for (const [date, list] of Object.entries(attendance)) {
-            if (list.includes(studentId)) sessions.push(date);
-        }
+        const sessions = Object.entries(attendance)
+            .filter(([, list]) => list.includes(studentId))
+            .map(([date]) => date);
         res.json({ student: student.name, sessions, count: sessions.length });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -621,7 +629,7 @@ app.delete('/api/attendance/reset', (req, res) => {
     }
 });
 
-// 10. Lấy danh sách ảnh mẫu
+// 10 & 11. Ảnh mẫu
 app.get('/api/sample-images', (req, res) => {
     try {
         const dbPath = path.join(__dirname, 'database');
@@ -632,47 +640,262 @@ app.get('/api/sample-images', (req, res) => {
     }
 });
 
-// 11. Lấy ảnh mẫu dưới dạng base64
 app.get('/api/sample-image/:filename', (req, res) => {
     try {
-        const filename = req.params.filename;
-        const filePath = path.join(__dirname, 'database', filename);
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ error: 'File not found' });
-        }
-        const data = fs.readFileSync(filePath);
-        const base64 = data.toString('base64');
-        res.json({ success: true, base64, filename });
+        const filePath = path.join(__dirname, 'database', req.params.filename);
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+        const base64 = fs.readFileSync(filePath).toString('base64');
+        res.json({ success: true, base64, filename: req.params.filename });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// 12. Lấy ảnh crop của học sinh
+// 12. Ảnh crop của học sinh
 app.get('/api/student/:id/cropped', (req, res) => {
     try {
-        const studentId = req.params.id;
-        const folder = getStudentFolder(studentId);
-        if (!fs.existsSync(folder)) {
-            return res.status(404).json({ error: 'Không có ảnh crop' });
-        }
+        const folder = getStudentFolder(req.params.id);
+        if (!fs.existsSync(folder)) return res.status(404).json({ error: 'Không có ảnh crop' });
         const files = fs.readdirSync(folder).filter(f => f.endsWith('.jpg'));
-        if (files.length === 0) {
-            return res.status(404).json({ error: 'Không có ảnh crop' });
-        }
-        const latestFile = files[files.length - 1];
-        const filePath = path.join(folder, latestFile);
-        const base64 = fs.readFileSync(filePath).toString('base64');
-        res.json({ success: true, base64, filename: latestFile });
+        if (files.length === 0) return res.status(404).json({ error: 'Không có ảnh crop' });
+        const base64 = fs.readFileSync(path.join(folder, files[files.length - 1])).toString('base64');
+        res.json({ success: true, base64, filename: files[files.length - 1] });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ==================== DEBUG: Kiểm tra số học sinh ====================
+// Part 3: API thống kê cảm xúc
+app.get('/api/emotion/stats/:studentId', async (req, res) => {
+    try {
+        const stats = await getEmotionStats(req.params.studentId);
+        res.json({ success: true, stats });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/emotion/class', async (req, res) => {
+    try {
+        const stats = await getClassEmotionStats();
+        res.json({ success: true, stats });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Debug
 app.get('/api/debug/students', (req, res) => {
     const all = loadAllStudentDescriptors();
-    res.json({ count: all.length, students: all.map(s => ({ id: s.id, name: s.name, descriptors: s.descriptors ? s.descriptors.length : 0 })) });
+    res.json({ count: all.length, students: all.map(s => ({ id: s.id, name: s.name, descriptors: s.descriptors?.length || 0 })) });
+});
+
+// ==================== PART 5: DASHBOARD & REPORT APIs ====================
+
+// Dashboard stats (tổng hợp)
+app.get('/api/stats', async (req, res) => {
+    try {
+        const stats = await getStats();
+        res.json(stats);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Weekly report data cho biểu đồ
+app.get('/api/report/week/:date', async (req, res) => {
+    try {
+        const { date } = req.params;
+        const allStudents = loadAllStudentDescriptors();
+        const total = allStudents.length;
+
+        const { db } = require('./db');
+        const present = await new Promise((resolve, reject) => {
+            db.get(`
+                SELECT COUNT(DISTINCT studentId) as count FROM events
+                WHERE date(timestamp) = ? AND action = 'attendance'
+            `, [date], (err, row) => err ? reject(err) : resolve(row?.count || 0));
+        });
+
+        res.json({ date, total, present, absent: total - present });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Behavior events today
+app.get('/api/behavior/today', async (req, res) => {
+    try {
+        const { db } = require('./db');
+        const today = new Date().toISOString().slice(0, 10);
+        const events = await new Promise((resolve, reject) => {
+            db.all(`
+                SELECT studentId, studentName, details, timestamp FROM events
+                WHERE action = 'behavior' AND date(timestamp) = ?
+                ORDER BY timestamp DESC
+            `, [today], (err, rows) => err ? reject(err) : resolve(rows));
+        });
+        res.json({ success: true, events });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PDF Report
+app.get('/api/report/pdf', async (req, res) => {
+    if (!PDFDocument) {
+        return res.status(503).json({ error: 'pdfkit chưa được cài. Chạy: npm install pdfkit' });
+    }
+    try {
+        const allStudents = loadAllStudentDescriptors();
+        const today = new Date().toISOString().slice(0, 10);
+        const todayAttendance = await getTodayAttendance();
+        const presentIds = new Set(todayAttendance.map(a => a.studentId));
+        const stats = await getStats();
+
+        const doc = new PDFDocument({ margin: 40, size: 'A4' });
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="baocao_${today}.pdf"`);
+        doc.pipe(res);
+
+        // Header
+        doc.fontSize(18).font('Helvetica-Bold').text('BÁO CÁO ĐIỂM DANH', { align: 'center' });
+        doc.fontSize(12).font('Helvetica').text(`Ngày: ${today}`, { align: 'center' });
+        doc.moveDown();
+
+        // Stats
+        doc.fontSize(13).font('Helvetica-Bold').text('THỐNG KÊ TỔNG QUAN');
+        doc.fontSize(11).font('Helvetica');
+        doc.text(`Tổng học sinh: ${stats.totalStudents}`);
+        doc.text(`Có mặt: ${stats.presentToday}`);
+        doc.text(`Vắng mặt: ${stats.totalStudents - stats.presentToday}`);
+        doc.text(`Tỷ lệ: ${stats.totalStudents > 0 ? Math.round(stats.presentToday / stats.totalStudents * 100) : 0}%`);
+        doc.moveDown();
+
+        // Present table
+        doc.fontSize(13).font('Helvetica-Bold').text('DANH SÁCH CÓ MẶT');
+        doc.fontSize(10).font('Helvetica');
+        const present = allStudents.filter(s => presentIds.has(s.id));
+        if (present.length === 0) {
+            doc.text('Chưa có học sinh nào điểm danh.');
+        } else {
+            present.forEach((s, i) => {
+                const time = todayAttendance.find(a => a.studentId === s.id)?.timestamp || '';
+                doc.text(`${i+1}. ${s.name} (${s.id}) - ${time}`);
+            });
+        }
+        doc.moveDown();
+
+        // Absent table
+        doc.fontSize(13).font('Helvetica-Bold').text('DANH SÁCH VẮNG MẶT');
+        doc.fontSize(10).font('Helvetica');
+        const absent = allStudents.filter(s => !presentIds.has(s.id));
+        if (absent.length === 0) {
+            doc.text('Tất cả học sinh đều có mặt!');
+        } else {
+            absent.forEach((s, i) => doc.text(`${i+1}. ${s.name} (${s.id})`));
+        }
+
+        doc.moveDown(2);
+        doc.fontSize(9).fillColor('#888').text(`Tạo lúc: ${getVietnamTime()}`, { align: 'right' });
+        doc.end();
+    } catch (err) {
+        console.error('PDF error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Excel Report
+app.get('/api/report/excel', async (req, res) => {
+    if (!ExcelJS) {
+        return res.status(503).json({ error: 'exceljs chưa được cài. Chạy: npm install exceljs' });
+    }
+    try {
+        const allStudents = loadAllStudentDescriptors();
+        const today = new Date().toISOString().slice(0, 10);
+        const todayAttendance = await getTodayAttendance();
+        const presentIds = new Set(todayAttendance.map(a => a.studentId));
+        const presentMap = {};
+        todayAttendance.forEach(a => { presentMap[a.studentId] = a.timestamp; });
+
+        const workbook = new ExcelJS.Workbook();
+        workbook.creator = 'Smart Classroom Monitor';
+        const sheet = workbook.addWorksheet(`Điểm danh ${today}`);
+
+        // Header row
+        sheet.columns = [
+            { header: 'STT', key: 'stt', width: 8 },
+            { header: 'Mã học sinh', key: 'id', width: 15 },
+            { header: 'Họ tên', key: 'name', width: 28 },
+            { header: 'Trạng thái', key: 'status', width: 15 },
+            { header: 'Thời gian điểm danh', key: 'time', width: 22 }
+        ];
+
+        // Style header
+        sheet.getRow(1).eachCell(cell => {
+            cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A2E' } };
+            cell.alignment = { horizontal: 'center' };
+        });
+
+        // Data rows
+        allStudents.forEach((s, i) => {
+            const isPresent = presentIds.has(s.id);
+            const row = sheet.addRow({
+                stt: i + 1,
+                id: s.id,
+                name: s.name,
+                status: isPresent ? '✅ Có mặt' : '❌ Vắng mặt',
+                time: presentMap[s.id] || ''
+            });
+            row.getCell('status').font = { color: { argb: isPresent ? 'FF2E7D32' : 'FFC62828' } };
+            if (i % 2 === 0) {
+                row.eachCell(c => c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8F9FA' } });
+            }
+        });
+
+        // Summary
+        sheet.addRow([]);
+        const stats = await getStats();
+        sheet.addRow(['', '', 'Tổng cộng:', allStudents.length, '']);
+        sheet.addRow(['', '', 'Có mặt:', stats.presentToday, '']);
+        sheet.addRow(['', '', 'Vắng mặt:', stats.totalStudents - stats.presentToday, '']);
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="diemdanh_${today}.xlsx"`);
+        await workbook.xlsx.write(res);
+        res.end();
+    } catch (err) {
+        console.error('Excel error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ==================== PART 6: GOOGLE SHEETS ====================
+
+app.post('/api/sheets/export', async (req, res) => {
+    if (!sheetsService) {
+        return res.status(503).json({ error: 'Google Sheets service chưa cấu hình. Cài googleapis và tạo services/googleSheets.js' });
+    }
+    if (!process.env.GOOGLE_SHEETS_SPREADSHEET_ID) {
+        return res.status(503).json({ error: 'Thiếu GOOGLE_SHEETS_SPREADSHEET_ID trong .env' });
+    }
+    try {
+        const allStudents = loadAllStudentDescriptors().map(s => ({ id: s.id, name: s.name }));
+        const today = new Date().toISOString().slice(0, 10);
+        const attendance = await getTodayAttendance();
+        const result = await sheetsService.exportAttendanceToSheets(allStudents, attendance, today);
+        res.json({ success: true, url: result.url, sheetName: result.sheetName, rows: result.rows });
+    } catch (err) {
+        console.error('Sheets export error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/sheets/link', (req, res) => {
+    const id = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+    if (!id) return res.status(503).json({ error: 'Chưa cấu hình Google Sheets' });
+    res.json({ success: true, url: `https://docs.google.com/spreadsheets/d/${id}` });
 });
 
 // ==================== KHỞI ĐỘNG ====================
@@ -681,8 +904,5 @@ scheduleReports();
 app.listen(PORT, () => {
     console.log(`🚀 Server chạy tại http://localhost:${PORT}`);
     console.log(`📅 Session hôm nay: ${currentSession}`);
-    console.log(`📁 File descriptors: ${DESCRIPTORS_FILE}`);
-    console.log(`📁 Thư mục học sinh: ${STUDENT_DATA_DIR}`);
-    console.log(`📁 Thư mục ảnh crop: ${CROPPED_FACES_DIR}`);
     console.log('✅ Đã khởi tạo lịch gửi báo cáo tự động');
 });
