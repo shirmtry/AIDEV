@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hệ thống giám sát lớp học</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🏫 Hệ thống giám sát lớp học</h1>
+            <div id="status">Đang tải mô hình...</div>
+        </header>
+
+        <main>
+            <div class="video-container">
+                <video id="video" autoplay muted playsinline></video>
+                <canvas id="overlay"></canvas>
+            </div>
+
+            <div class="info-panel">
+                <div class="attendance-box">
+                    <h3>📋 Điểm danh hôm nay</h3>
+                    <div id="attendance-list">Đang cập nhật...</div>
+                </div>
+                <div class="behavior-box">
+                    <h3>⚠️ Cảnh báo hành vi</h3>
+                    <div id="behavior-log">Chưa có cảnh báo</div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <button id="captureBtn">📸 Nhận diện ngay</button>
+            <button id="attendanceBtn">📊 Xem điểm danh</button>
+            <button id="registerBtn">➕ Đăng ký học sinh</button>
+        </footer>
+    </div>
+
+    <!-- Modal đăng ký học sinh -->
+    <div id="registerModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>📝 Đăng ký học sinh</h2>
+            <div class="form-group">
+                <label>Họ tên:</label>
+                <input type="text" id="studentName" placeholder="Nhập tên học sinh" />
+            </div>
+            <div class="form-group">
+                <label>Mã số:</label>
+                <input type="text" id="studentId" placeholder="Nhập mã số (ví dụ: HS001)" />
+            </div>
+            <div class="form-group">
+                <label>Chọn ảnh khuôn mặt:</label>
+                <input type="file" id="imageUpload" accept="image/*" />
+            </div>
+            <div id="previewContainer">
+                <img id="previewImage" style="display:none; max-width:200px; border-radius:8px;" />
+                <div id="registerStatus" style="margin-top:10px;"></div>
+            </div>
+            <button id="submitRegister" class="btn-primary">Đăng ký</button>
+        </div>
+    </div>
+    <script src="face-api.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,120 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: #f0f2f5;
+    color: #333;
+    min-height: 100vh;
+}
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+}
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: white;
+    padding: 15px 25px;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    margin-bottom: 20px;
+}
+header h1 { font-size: 24px; }
+#status {
+    background: #e8f5e9;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 14px;
+    color: #2e7d32;
+}
+main {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 20px;
+}
+.video-container {
+    position: relative;
+    background: #1a1a2e;
+    border-radius: 12px;
+    overflow: hidden;
+    aspect-ratio: 16/9;
+}
+#video, #overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+#overlay {
+    pointer-events: none;
+}
+.info-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+.attendance-box, .behavior-box {
+    background: white;
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    flex: 1;
+    overflow-y: auto;
+    max-height: 300px;
+}
+.attendance-box h3, .behavior-box h3 {
+    font-size: 16px;
+    margin-bottom: 12px;
+    color: #555;
+}
+#attendance-list, #behavior-log {
+    font-size: 14px;
+    line-height: 1.8;
+}
+.student-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid #f0f0f0;
+}
+.student-item .name { font-weight: 500; }
+.student-item .status { color: #4caf50; }
+.student-item .status.absent { color: #f44336; }
+
+footer {
+    margin-top: 20px;
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+}
+footer button {
+    padding: 12px 28px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+#captureBtn {
+    background: #1976d2;
+    color: white;
+}
+#captureBtn:hover { background: #1565c0; }
+#attendanceBtn {
+    background: #43a047;
+    color: white;
+}
+#attendanceBtn:hover { background: #388e3c; }
+
+@media (max-width: 768px) {
+    main { grid-template-columns: 1fr; }
+    .video-container { aspect-ratio: 4/3; }
+}
