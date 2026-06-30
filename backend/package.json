@@ -1,7 +1,7 @@
 {
   "name": "classroom-monitor-backend",
   "version": "1.0.0",
-  "description": "Hệ thống giám sát lớp học với face-api.js (server nhận descriptor)",
+  "description": "Hệ thống giám sát lớp học với face-api.js",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

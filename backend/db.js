@@ -119,17 +119,17 @@ function getStudentAttendance(studentId) {
 
 function getStats() {
     return new Promise((resolve, reject) => {
-        db.all(`SELECT COUNT(DISTINCT studentId) as totalStudents FROM students`, (err, totalRow) => {
+        db.get(`SELECT COUNT(DISTINCT studentId) as totalStudents FROM students`, (err, totalRow) => {
             if (err) reject(err);
-            db.all(`
+            db.get(`
                 SELECT COUNT(DISTINCT studentId) as presentToday
                 FROM events
                 WHERE date(timestamp) = date('now') AND action = 'attendance'
             `, (err2, presentRow) => {
                 if (err2) reject(err2);
                 resolve({
-                    totalStudents: totalRow[0].totalStudents || 0,
-                    presentToday: presentRow[0].presentToday || 0
+                    totalStudents: totalRow ? totalRow.totalStudents : 0,
+                    presentToday: presentRow ? presentRow.presentToday : 0
                 });
             });
         });
@@ -139,6 +139,39 @@ function getStats() {
 function getStudentsWithGender() {
     return new Promise((resolve, reject) => {
         db.all(`SELECT studentId, studentName, gender FROM students`, (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+// ==================== HÀM THỐNG KÊ CẢM XÚC ====================
+function getEmotionStats(studentId) {
+    return new Promise((resolve, reject) => {
+        const today = new Date().toISOString().slice(0, 10);
+        db.all(`
+            SELECT json_extract(details, '$.emotion') as emotion, COUNT(*) as count
+            FROM events
+            WHERE studentId = ? AND action = 'emotion' AND date(timestamp) = ?
+            GROUP BY emotion
+            ORDER BY count DESC
+        `, [studentId, today], (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+}
+
+function getClassEmotionStats() {
+    return new Promise((resolve, reject) => {
+        const today = new Date().toISOString().slice(0, 10);
+        db.all(`
+            SELECT json_extract(details, '$.emotion') as emotion, COUNT(*) as count
+            FROM events
+            WHERE action = 'emotion' AND date(timestamp) = ?
+            GROUP BY emotion
+            ORDER BY count DESC
+        `, [today], (err, rows) => {
             if (err) reject(err);
             else resolve(rows);
         });
@@ -155,5 +188,7 @@ module.exports = {
     getStudentAttendance,
     getStats,
     getVietnamTime,
-    getStudentsWithGender
+    getStudentsWithGender,
+    getEmotionStats,
+    getClassEmotionStats
 };
