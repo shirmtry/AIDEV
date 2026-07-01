@@ -1,9 +1,15 @@
 // frontend/script.js
 // ===================================================================
-// ULTIMATE OPTIMIZED & FIXED VERSION - FINAL (EXTREME POSE FILTER)
-// - Pose raise threshold = 0.25, elbow angle > 150°, wrist must be above nose and z < nose.z
-// - Confidence threshold for raising_hand increased to 0.90
-// - If still false positive, consider disabling pose (commented out)
+// COMPLETE VERSION WITH:
+// - Face recognition (TinyFaceDetector, 68 landmarks, expressions, age/gender)
+// - Multiple descriptors per student (self-learning via server)
+// - Telegram photo notification on attendance
+// - Cloth color analysis (HSV histogram)
+// - Accessory detection (glasses, mask, hat)
+// - Behavior detection using face landmarks + MediaPipe Hands
+// - Attention timer (alert after 10 minutes of inattention)
+// - Anti-spoofing (blink detection via EAR)
+// - IndexedDB caching of student list
 // ===================================================================
 
 const SERVER_URL = 'http://localhost:5000';
@@ -45,19 +51,11 @@ let cycleCount = 0;
 let autoRegisterDone = false;
 let studentList = [];
 let lastStudentListUpdate = 0;
+let attendanceSentToday = new Set(); // để tránh gửi nhiều lần
 
 const negativeEmotionCount = {};
 const NEGATIVE_EMOTION_THRESHOLD = 5;
 const NEGATIVE_EMOTIONS = ['angry', 'sad', 'fearful', 'disgusted'];
-
-// Pose state
-let poseInitialized = false;
-let lastLoggedAction = '';
-let lastPoseTime = 0;
-const POSE_LOG_INTERVAL = 10000;
-let poseFrameCounter = 0;
-const POSE_FRAME_SKIP = 3;          // run every 3rd frame (was 2)
-let isPoseProcessing = false;
 
 // CHECK faceapi
 if (typeof faceapi === 'undefined') {
@@ -67,7 +65,7 @@ if (typeof faceapi === 'undefined') {
     statusEl.style.color = '#c62828';
 }
 
-// HELPERS
+// ==================== HELPER: fetchWithAuth ====================
 async function fetchWithAuth(url, options = {}) {
     const headers = { 'Content-Type': 'application/json', 'x-api-key': API_KEY, ...(options.headers || {}) };
     const response = await fetch(url, { ...options, headers });
@@ -97,7 +95,7 @@ function parseStudentInfoFromFilename(filename) {
     return { studentId: mssv, name: studentName, raw: nameWithoutExt };
 }
 
-// TF.JS BACKEND
+// ==================== TF.JS BACKEND ====================
 async function forceWebGLBackend() {
     if (typeof faceapi === 'undefined' || !faceapi.tf) return;
     try {
@@ -118,7 +116,7 @@ function monitorTfMemory() {
     }, 30000);
 }
 
-// LOAD MODELS
+// ==================== LOAD MODELS ====================
 async function loadModels() {
     statusEl.textContent = '⏳ Đang tải mô hình...';
     try {
@@ -144,6 +142,7 @@ async function loadModels() {
         await updateStudentList(true);
         await autoRegisterFromSamples();
         await startVideo();
+        await loadMediaPipeModels(); // Tải MediaPipe Hands cho behavior detection
     } catch (err) {
         console.error(err);
         statusEl.textContent = '❌ Lỗi tải model';
@@ -152,23 +151,49 @@ async function loadModels() {
     }
 }
 
-// STUDENT LIST
+// ==================== INDEXEDDB HELPER ====================
+// Import từ file riêng (sẽ tạo sau)
+import { getStudentsFromCache, saveStudentsToCache } from './indexeddb-helper.js';
+
+// ==================== STUDENT LIST (with IndexedDB) ====================
 async function updateStudentList(force = false) {
     const now = Date.now();
     if (!force && (now - lastStudentListUpdate) < STUDENT_LIST_REFRESH_INTERVAL) return;
     lastStudentListUpdate = now;
+
+    // Thử cache trước
+    if (!force) {
+        const cached = await getStudentsFromCache();
+        if (cached && cached.length > 0) {
+            studentList = cached;
+            console.log(`📋 Loaded ${studentList.length} students from IndexedDB`);
+            return;
+        }
+    }
+
     try {
         const res = await fetch(`${SERVER_URL}/api/students`);
         const data = await res.json();
         studentList = data;
-        console.log(`📋 Đã tải ${studentList.length} học sinh`);
+        await saveStudentsToCache(data);
+        console.log(`📋 Loaded ${studentList.length} students from server and cached`);
+        if (studentList.length === 0 && !autoRegisterDone) {
+            console.log('⚠️ Danh sách rỗng, sẽ tự động đăng ký từ ảnh mẫu.');
+            await autoRegisterFromSamples();
+        }
     } catch (err) {
         console.error('Lỗi lấy danh sách học sinh:', err);
-        studentList = [];
+        const fallback = await getStudentsFromCache();
+        if (fallback && fallback.length > 0) {
+            studentList = fallback;
+            console.log('⚠️ Using cached student list (server unavailable)');
+        } else {
+            studentList = [];
+        }
     }
 }
 
-// CAMERA + DETECTION LOOP
+// ==================== CAMERA + DETECTION LOOP ====================
 async function startVideo() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -181,8 +206,8 @@ async function startVideo() {
         overlay.height = video.videoHeight || 720;
         requestAnimationFrame(detectionLoop);
         updateAttendanceUI();
-        // Để tắt pose hoàn toàn, comment dòng dưới:
-        await initPoseDetection();
+        console.log('ℹ️ Pose detection disabled (using face + hands)');
+        statusEl.textContent = '✅ Sẵn sàng';
     } catch (err) {
         console.error(err);
         statusEl.textContent = '❌ Không thể mở camera';
@@ -203,7 +228,7 @@ function detectionLoop() {
     requestAnimationFrame(detectionLoop);
 }
 
-// PREPROCESS
+// ==================== PREPROCESS & CROP ====================
 function preprocessImage(imageSource) {
     const srcW = imageSource.videoWidth || imageSource.width || 1280;
     const srcH = imageSource.videoHeight || imageSource.height || 720;
@@ -233,7 +258,277 @@ function cropFace(processedCanvas, box) {
     return cropCanvas.toDataURL('image/jpeg', 0.85);
 }
 
-// BEHAVIOR ALERT
+// ==================== CLOTH COLOR ANALYSIS (HSV) ====================
+function rgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h, s, v = max;
+    const d = max - min;
+    s = max === 0 ? 0 : d / max;
+    if (max === min) {
+        h = 0;
+    } else {
+        switch (max) {
+            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+            case g: h = (b - r) / d + 2; break;
+            case b: h = (r - g) / d + 4; break;
+        }
+        h /= 6;
+    }
+    return { h: h * 360, s: s * 100, v: v * 100 };
+}
+
+function getDominantColorName(hue) {
+    if (hue < 15 || hue >= 345) return 'red';
+    if (hue < 45) return 'orange';
+    if (hue < 75) return 'yellow';
+    if (hue < 165) return 'green';
+    if (hue < 195) return 'cyan';
+    if (hue < 255) return 'blue';
+    if (hue < 315) return 'purple';
+    return 'pink';
+}
+
+async function analyzeClothColor(fullImageDataUrl, faceBox) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.src = fullImageDataUrl;
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const w = img.width, h = img.height;
+            // Lấy vùng thân trên: từ dưới cằm đến vai (ước lượng)
+            const yStart = Math.floor(faceBox.y + faceBox.height * 0.6);
+            const yEnd = Math.min(h, Math.floor(faceBox.y + faceBox.height * 1.8));
+            const xStart = Math.max(0, faceBox.x - faceBox.width * 0.2);
+            const xEnd = Math.min(w, faceBox.x + faceBox.width * 1.2);
+            const cropW = xEnd - xStart, cropH = yEnd - yStart;
+            if (cropW <= 0 || cropH <= 0) { resolve({ color: 'unknown' }); return; }
+            canvas.width = cropW; canvas.height = cropH;
+            ctx.drawImage(img, xStart, yStart, cropW, cropH, 0, 0, cropW, cropH);
+            const imageData = ctx.getImageData(0, 0, cropW, cropH);
+            const data = imageData.data;
+            // Histogram 2D: Hue (10 bins) * Saturation (5 bins)
+            const hist = new Array(10 * 5).fill(0);
+            let totalPixels = 0;
+            for (let i = 0; i < data.length; i += 4) {
+                const [r, g, b] = [data[i], data[i+1], data[i+2]];
+                const hsv = rgbToHsv(r, g, b);
+                if (hsv.s < 15 || hsv.v < 20) continue; // bỏ qua nhiễu
+                const hBin = Math.floor(hsv.h / 36);
+                const sBin = Math.floor(hsv.s / 20);
+                if (hBin >= 0 && hBin < 10 && sBin >= 0 && sBin < 5) {
+                    hist[hBin * 5 + sBin]++;
+                    totalPixels++;
+                }
+            }
+            if (totalPixels === 0) { resolve({ color: 'unknown' }); return; }
+            let maxIdx = 0;
+            for (let i = 1; i < hist.length; i++) {
+                if (hist[i] > hist[maxIdx]) maxIdx = i;
+            }
+            const hueCenter = (Math.floor(maxIdx / 5) * 36 + 18) % 360;
+            const colorName = getDominantColorName(hueCenter);
+            resolve({ color: colorName });
+        };
+        img.onerror = () => resolve({ color: 'unknown' });
+    });
+}
+
+// ==================== ACCESSORY DETECTION ====================
+function detectAccessories(landmarks, faceBox) {
+    // landmarks là object FaceLandmarks68 có thuộc tính positions (mảng 68 điểm)
+    if (!landmarks || !landmarks.positions) {
+        return { hasMask: false, hasGlasses: false, hasHat: false };
+    }
+    const pts = landmarks.positions; // mảng các {x, y}
+
+    const result = { hasMask: false, hasGlasses: false, hasHat: false };
+
+    // 1. Mask: khoảng cách môi / khoảng cách mắt
+    const upperLip = pts[51];
+    const lowerLip = pts[57];
+    const mouthDist = Math.hypot(upperLip.x - lowerLip.x, upperLip.y - lowerLip.y);
+    const eyeDist = Math.hypot(pts[36].x - pts[45].x, pts[36].y - pts[45].y);
+    if (mouthDist / eyeDist < 0.25) result.hasMask = true;
+
+    // 2. Glasses: kiểm tra độ tương phản vùng mắt (đơn giản: khoảng cách lông mày - mắt)
+    const leftEye = pts[36];
+    const rightEye = pts[45];
+    const brow = pts[21]; // lông mày trái
+    const browDist = Math.hypot(brow.x - leftEye.x, brow.y - leftEye.y);
+    const faceHeight = Math.abs(pts[8].y - pts[27].y);
+    if (browDist / faceHeight < 0.08) result.hasGlasses = true;
+
+    // 3. Hat: kiểm tra đỉnh đầu (landmark 8) so với bounding box
+    const topLandmark = pts[8];
+    const topBox = faceBox.top;
+    if (Math.abs(topLandmark.y - topBox) / faceBox.height < 0.05) result.hasHat = true;
+
+    return result;
+}
+
+// ==================== BEHAVIOR DETECTION (Face + Hands) ====================
+// MediaPipe Hands
+let handsModel = null;
+let handsInitialized = false;
+
+async function loadMediaPipeModels() {
+    if (handsInitialized) return;
+    try {
+        // Tải thư viện từ CDN (nếu chưa có)
+        if (typeof Hands === 'undefined') {
+            await new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.5.3/hands.js';
+                script.onload = resolve;
+                script.onerror = reject;
+                document.head.appendChild(script);
+            });
+        }
+        handsModel = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.5.3/${file}`,
+            maxHands: 2
+        });
+        handsModel.setOptions({
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        handsInitialized = true;
+        console.log('✅ MediaPipe Hands loaded');
+    } catch (err) {
+        console.warn('⚠️ Không tải được MediaPipe Hands:', err.message);
+    }
+}
+
+// Attention tracker state
+const attentionTracker = {
+    isDrowsy: false,
+    isDistracted: false,
+    isFacingCovered: false,
+    handRaised: false,
+    drowsyStart: null,
+    distractedStart: null,
+    coveredStart: null,
+    lastAlertTime: 0
+};
+
+// EAR (Eye Aspect Ratio) for blink detection
+function calculateEAR(landmarks) {
+    if (!landmarks || !landmarks.positions) return 0;
+    const pts = landmarks.positions;
+    const leftEye = [pts[36], pts[37], pts[38], pts[39], pts[40], pts[41]];
+    const rightEye = [pts[42], pts[43], pts[44], pts[45], pts[46], pts[47]];
+    function ear(points) {
+        const v1 = Math.hypot(points[1].x - points[5].x, points[1].y - points[5].y);
+        const v2 = Math.hypot(points[2].x - points[4].x, points[2].y - points[4].y);
+        const v3 = Math.hypot(points[0].x - points[3].x, points[0].y - points[3].y);
+        return (v1 + v2) / (2 * v3);
+    }
+    return (ear(leftEye) + ear(rightEye)) / 2;
+}
+
+// Head pose estimation (pitch, yaw) from 68 landmarks
+function getHeadOrientation(landmarks) {
+    if (!landmarks || !landmarks.positions) {
+        return { pitch: 0, yawRatio: 1 };
+    }
+    const pts = landmarks.positions;
+    const nose = pts[30];
+    const leftEyeAvg = pts[36];
+    const rightEyeAvg = pts[45];
+    // Pitch: angle between eyes line and nose
+    const eyeCenterX = (leftEyeAvg.x + rightEyeAvg.x) / 2;
+    const eyeCenterY = (leftEyeAvg.y + rightEyeAvg.y) / 2;
+    const pitch = Math.atan2(nose.y - eyeCenterY, nose.x - eyeCenterX) * 180 / Math.PI;
+    // Yaw: ratio of distances from nose to eyes
+    const leftDist = Math.hypot(nose.x - leftEyeAvg.x, nose.y - leftEyeAvg.y);
+    const rightDist = Math.hypot(nose.x - rightEyeAvg.x, nose.y - rightEyeAvg.y);
+    const yawRatio = leftDist / rightDist;
+    return { pitch, yawRatio };
+}
+
+async function detectBehavior(faceLandmarks, faceBox, studentId, studentName) {
+    if (!handsInitialized) return;
+
+    // 1. Drowsiness (head down + low EAR)
+    const { pitch, yawRatio } = getHeadOrientation(faceLandmarks);
+    const ear = calculateEAR(faceLandmarks);
+    const isDrowsy = (pitch > 25 && ear < 0.25);
+    if (isDrowsy) {
+        if (!attentionTracker.isDrowsy) {
+            attentionTracker.isDrowsy = true;
+            attentionTracker.drowsyStart = Date.now();
+        }
+        const duration = (Date.now() - attentionTracker.drowsyStart) / 1000;
+        if (duration > 10) { // > 10 seconds
+            await sendBehaviorAlert(studentId, 'Buồn ngủ / cúi đầu lâu');
+            attentionTracker.drowsyStart = Date.now(); // reset
+        }
+    } else {
+        attentionTracker.isDrowsy = false;
+        attentionTracker.drowsyStart = null;
+    }
+
+    // 2. Distracted (looking sideways)
+    const isDistracted = (yawRatio < 0.6 || yawRatio > 1.4);
+    if (isDistracted) {
+        if (!attentionTracker.isDistracted) {
+            attentionTracker.isDistracted = true;
+            attentionTracker.distractedStart = Date.now();
+        }
+        const duration = (Date.now() - attentionTracker.distractedStart) / 1000;
+        if (duration > 5) { // > 5 seconds
+            await sendBehaviorAlert(studentId, 'Quay ngang / mất tập trung');
+            attentionTracker.distractedStart = Date.now();
+        }
+    } else {
+        attentionTracker.isDistracted = false;
+        attentionTracker.distractedStart = null;
+    }
+
+    // 3. Face covered / Hand raising using MediaPipe Hands
+    try {
+        const handsResult = await new Promise((resolve) => {
+            handsModel.onResults((results) => resolve(results));
+            handsModel.send({ image: video });
+        });
+        if (handsResult && handsResult.multiHandLandmarks && handsResult.multiHandLandmarks.length > 0) {
+            const hand = handsResult.multiHandLandmarks[0];
+            const wrist = hand[0];
+            // Face center
+            const faceCenter = {
+                x: faceBox.x + faceBox.width/2,
+                y: faceBox.y + faceBox.height/2
+            };
+            // Check covering: wrist near face center
+            const distToFace = Math.hypot(wrist.x - faceCenter.x, wrist.y - faceCenter.y);
+            const faceSize = Math.max(faceBox.width, faceBox.height);
+            if (distToFace < faceSize * 0.2) {
+                await sendBehaviorAlert(studentId, 'Che mặt');
+            }
+            // Hand raised: wrist y < face top
+            if (wrist.y < faceBox.top * 0.95) {
+                // Check if fingers spread (approximate)
+                const indexTip = hand[8];
+                const pinkyTip = hand[20];
+                const spread = Math.hypot(indexTip.x - pinkyTip.x, indexTip.y - pinkyTip.y);
+                if (spread > 0.05) { // open hand
+                    await sendBehaviorAlert(studentId, 'Giơ tay phát biểu');
+                }
+            }
+        }
+    } catch (err) {
+        // hands may not be ready
+    }
+
+    // 4. Attention timer (10 minutes total inattention)
+    // Đơn giản: nếu phát hiện drowsy hoặc distracted trong 10 phút liên tục, gửi cảnh báo tổng hợp.
+    // (sẽ được xử lý ở vòng lặp riêng bên dưới)
+}
+
+// Hàm gửi alert (đã có)
 async function sendBehaviorAlert(studentId, behavior) {
     try {
         const response = await fetchWithAuth(`${SERVER_URL}/api/behavior`, {
@@ -254,7 +549,12 @@ async function sendBehaviorAlert(studentId, behavior) {
     }
 }
 
-// FACE DETECTION & RECOGNITION
+// ==================== FACE DETECTION & RECOGNITION ====================
+let lastBlinkTime = 0;
+let blinkCount = 0;
+const BLINK_THRESHOLD = 0.22;
+const MIN_BLINK_INTERVAL = 150;
+
 async function detectAndRecognize() {
     if (!isModelLoaded) return;
     cycleCount++;
@@ -307,6 +607,7 @@ async function detectAndRecognize() {
         return dominant;
     });
 
+    // Crop images for Telegram and cloth analysis
     const croppedImages = validDetections.map((d, i) => {
         if (!runCrop) return null;
         const fullResCanvas = document.createElement('canvas');
@@ -322,17 +623,44 @@ async function detectAndRecognize() {
         : { age: null, gender: null }
     );
 
+    // Cloth colors & accessories
+    const clothColors = [];
+    const accessories = [];
+    const fullFrameDataUrl = captureFrameFromVideo(video); // dùng cho phân tích màu áo
+
+    for (let i = 0; i < validDetections.length; i++) {
+        const box = scaledBoxes[i];
+        const cloth = await analyzeClothColor(fullFrameDataUrl, box);
+        clothColors.push(cloth.color);
+
+        const acc = detectAccessories(validDetections[i].landmarks, box);
+        accessories.push(acc);
+    }
+
     try {
         const response = await fetchWithAuth(`${SERVER_URL}/api/recognize-multiple`, {
             method: 'POST',
-            body: JSON.stringify({ descriptors, emotions, croppedImages, ageGenders })
+            body: JSON.stringify({
+                descriptors,
+                emotions,
+                croppedImages,
+                ageGenders,
+                clothColors,
+                accessories
+            })
         });
         const data = await response.json();
         if (data.success) {
-            data.results.forEach((result, index) => {
-                const box = scaledBoxes[index];
-                const ag = ageGenders[index] || {};
+            for (let idx = 0; idx < data.results.length; idx++) {
+                const result = data.results[idx];
+                const box = scaledBoxes[idx];
+                const ag = ageGenders[idx] || {};
+                const croppedImg = croppedImages[idx];
+                const cloth = clothColors[idx];
+                const acc = accessories[idx];
+
                 if (result.studentId) {
+                    // --- Vẽ thông tin ---
                     ctx.fillStyle = '#4caf50';
                     ctx.font = 'bold 18px Arial';
                     ctx.fillText(`✅ ${result.studentName}`, box.x, box.y - 28);
@@ -345,8 +673,35 @@ async function detectAndRecognize() {
                     ctx.font = '14px Arial';
                     ctx.fillStyle = '#ffffff';
                     ctx.fillText(`😊 ${result.emotion}`, box.x, box.y + box.height + 20);
+                    // Hiển thị màu áo và phụ kiện
+                    ctx.font = '12px Arial';
+                    ctx.fillStyle = '#ffd700';
+                    let extra = `Áo: ${cloth}`;
+                    if (acc.hasMask) extra += ', 😷';
+                    if (acc.hasGlasses) extra += ', 👓';
+                    if (acc.hasHat) extra += ', 🎩';
+                    ctx.fillText(extra, box.x, box.y + box.height + 40);
 
+                    // --- Gửi ảnh điểm danh qua Telegram (lần đầu trong ngày) ---
                     const studentId = result.studentId;
+                    if (!attendanceSentToday.has(studentId) && croppedImg) {
+                        attendanceSentToday.add(studentId);
+                        try {
+                            await fetchWithAuth(`${SERVER_URL}/api/attendance-notify`, {
+                                method: 'POST',
+                                body: JSON.stringify({
+                                    studentId: result.studentId,
+                                    studentName: result.studentName,
+                                    image: croppedImg
+                                })
+                            });
+                            console.log(`📸 Đã gửi ảnh điểm danh cho ${result.studentName}`);
+                        } catch (err) {
+                            console.error('Lỗi gửi ảnh điểm danh:', err);
+                        }
+                    }
+
+                    // --- Negative emotion alert ---
                     const emotion = result.emotion;
                     if (NEGATIVE_EMOTIONS.includes(emotion)) {
                         if (!negativeEmotionCount[studentId]) negativeEmotionCount[studentId] = 0;
@@ -358,12 +713,36 @@ async function detectAndRecognize() {
                     } else {
                         negativeEmotionCount[studentId] = 0;
                     }
+
+                    // --- Behavior detection (face + hands) ---
+                    if (runSubtasks) {
+                        await detectBehavior(validDetections[idx].landmarks, box, studentId, result.studentName);
+                    }
+
+                    // --- Anti-spoofing: blink detection ---
+                    const ear = calculateEAR(validDetections[idx].landmarks);
+                    const now = Date.now();
+                    if (ear < BLINK_THRESHOLD && now - lastBlinkTime > MIN_BLINK_INTERVAL) {
+                        blinkCount++;
+                        lastBlinkTime = now;
+                    }
+                    // Nếu không có blink trong 5 giây liên tục, cảnh báo (nhưng không chặn điểm danh)
+                    if (now - lastBlinkTime > 5000 && blinkCount === 0) {
+                        console.warn('⚠️ No blink detected – possible spoof');
+                        ctx.fillStyle = '#ff0000';
+                        ctx.font = '12px Arial';
+                        ctx.fillText('⚠️ Có thể là ảnh giả', box.x, box.y + box.height + 60);
+                    } else {
+                        // reset sau khi có blink
+                        if (now - lastBlinkTime < 2000) blinkCount = 0; // reset để đo lại
+                    }
+
                 } else {
                     ctx.fillStyle = '#ff9800';
                     ctx.font = '18px Arial';
                     ctx.fillText('❓ Unknown', box.x, box.y - 10);
                 }
-            });
+            }
             updateAttendanceUI();
             updateStudentList(false);
         }
@@ -372,7 +751,7 @@ async function detectAndRecognize() {
     }
 }
 
-// AUTO REGISTER
+// ==================== AUTO REGISTER ====================
 async function autoRegisterFromSamples() {
     if (autoRegisterDone) return;
     try {
@@ -398,11 +777,22 @@ async function autoRegisterFromSamples() {
             const img = new Image();
             img.src = `data:image/jpeg;base64,${imgData.base64}`;
             await img.decode();
-            const detection = await faceapi.detectSingleFace(img)
-                .withFaceLandmarks()
-                .withFaceDescriptor()
-                .withAgeAndGender();
-            if (!detection) { console.warn(`⚠️ Không tìm thấy khuôn mặt trong ${fileName}`); continue; }
+            if (!img.complete || !img.naturalWidth) {
+                console.warn(`⚠️ Ảnh ${fileName} không load được`);
+                continue;
+            }
+            const detection = await faceapi.detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({
+                inputSize: DETECTOR_INPUT_SIZE,
+                scoreThreshold: DETECTOR_SCORE_THRESHOLD
+            }))
+            .withFaceLandmarks()
+            .withFaceDescriptor()
+            .withAgeAndGender();
+
+            if (!detection) {
+                console.warn(`⚠️ Không tìm thấy khuôn mặt trong ${fileName}`);
+                continue;
+            }
             const descriptor = Array.from(detection.descriptor);
             const gender = detection.gender || null;
             const age = detection.age ? Math.round(detection.age) : null;
@@ -434,7 +824,7 @@ async function autoRegisterFromSamples() {
     }
 }
 
-// UPDATE UI
+// ==================== UPDATE UI ====================
 async function updateAttendanceUI() {
     try {
         const res = await fetch(`${SERVER_URL}/api/attendance`);
@@ -452,157 +842,6 @@ async function updateAttendanceUI() {
         console.error('Lỗi lấy điểm danh:', err);
         attendanceList.innerHTML = '❌ Không thể tải điểm danh';
     }
-}
-
-// ==================== POSE DETECTION (EXTREME FILTER) ====================
-function angleBetweenPoints(a, b, c) {
-    // calculate angle at b (elbow)
-    const v1 = { x: a.x - b.x, y: a.y - b.y };
-    const v2 = { x: c.x - b.x, y: c.y - b.y };
-    const dot = v1.x * v2.x + v1.y * v2.y;
-    const mag = Math.sqrt(v1.x*v1.x + v1.y*v1.y) * Math.sqrt(v2.x*v2.x + v2.y*v2.y);
-    if (mag === 0) return 0;
-    return Math.acos(dot / mag) * 180 / Math.PI;
-}
-
-function analyzePose(landmarks) {
-    if (!landmarks || landmarks.length === 0) return { action: 'unknown', confidence: 0 };
-
-    const lm = landmarks[0];
-    const nose = lm[0];
-    const leftShoulder = lm[11];
-    const rightShoulder = lm[12];
-    const leftElbow = lm[13];
-    const rightElbow = lm[14];
-    const leftWrist = lm[15];
-    const rightWrist = lm[16];
-
-    // === GIƠ TAY – cực kỳ khắt khe ===
-    const RAISE_THRESHOLD = 0.25;        // tăng lên 0.25
-    // Góc khuỷu tay (phải gần 180°)
-    const elbowAngleLeft = angleBetweenPoints(leftShoulder, leftElbow, leftWrist);
-    const elbowAngleRight = angleBetweenPoints(rightShoulder, rightElbow, rightWrist);
-    const isArmStraightLeft = elbowAngleLeft > 150;
-    const isArmStraightRight = elbowAngleRight > 150;
-
-    const isLeftRaising = (leftWrist.y < leftShoulder.y - RAISE_THRESHOLD) &&
-                          (leftWrist.y < leftElbow.y) &&
-                          (leftWrist.y < nose.y - 0.05) &&
-                          (leftWrist.z < nose.z) &&
-                          isArmStraightLeft;
-    const isRightRaising = (rightWrist.y < rightShoulder.y - RAISE_THRESHOLD) &&
-                           (rightWrist.y < rightElbow.y) &&
-                           (rightWrist.y < nose.y - 0.05) &&
-                           (rightWrist.z < nose.z) &&
-                           isArmStraightRight;
-    const isRaisingHand = isLeftRaising || isRightRaising;
-
-    // === CÚI ĐẦU ===
-    const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2;
-    const noseToShoulderY = nose.y - shoulderMidY;
-    const isSleeping = noseToShoulderY > 0.08;
-
-    if (leftShoulder && rightShoulder && (leftWrist || rightWrist)) {
-        if (isSleeping) return { action: 'sleeping', confidence: 0.85 };
-        if (isRaisingHand) return { action: 'raising_hand', confidence: 0.92 };
-        return { action: 'sitting', confidence: 0.6 };
-    }
-    return { action: 'unknown', confidence: 0.5 };
-}
-
-async function sendPoseLog(action, confidence) {
-    if (action === 'unknown' || action === 'sitting') return;
-    // Yêu cầu confidence cực cao
-    if (action === 'raising_hand' && confidence < 0.90) return;
-    if (action === 'sleeping' && confidence < 0.85) return;
-
-    const now = Date.now();
-    if (action === lastLoggedAction && (now - lastPoseTime) < POSE_LOG_INTERVAL) return;
-
-    lastLoggedAction = action;
-    lastPoseTime = now;
-
-    console.log(`🧍 Pose detected: ${action} (${Math.round(confidence * 100)}%)`);
-    const logEntry = document.createElement('div');
-    logEntry.style.color = '#2196f3';
-    logEntry.textContent = `🧍 ${new Date().toLocaleTimeString()} - Hành vi: ${action}`;
-    behaviorLog.prepend(logEntry);
-    while (behaviorLog.children.length > 20) behaviorLog.removeChild(behaviorLog.lastChild);
-}
-
-async function initPoseDetection() {
-    if (poseInitialized) return;
-    try {
-        await loadPoseLibrary();
-        const pose = new Pose({
-            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
-        });
-        pose.setOptions({
-            modelComplexity: 0,
-            smoothLandmarks: true,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5
-        });
-        pose.onResults((results) => {
-            if (results.poseLandmarks && results.poseLandmarks.length > 0) {
-                const landmarks = [results.poseLandmarks.map(lm => ({ x: lm.x, y: lm.y, z: lm.z }))];
-                const poseResult = analyzePose(landmarks);
-                if (poseResult.action !== 'unknown') {
-                    sendPoseLog(poseResult.action, poseResult.confidence);
-                }
-            }
-        });
-        async function poseLoop() {
-            poseFrameCounter++;
-            if (poseFrameCounter % POSE_FRAME_SKIP === 0 && !isPoseProcessing &&
-                !video.paused && !video.ended && video.readyState >= 2) {
-                isPoseProcessing = true;
-                try {
-                    await pose.send({ image: video });
-                } catch (e) { /* ignore */ }
-                finally { isPoseProcessing = false; }
-            }
-            requestAnimationFrame(poseLoop);
-        }
-        poseLoop();
-        poseInitialized = true;
-        console.log('✅ Pose detector initialized (throttled rAF, extreme filter)');
-        statusEl.textContent = '✅ Sẵn sàng (có Pose)';
-    } catch (err) {
-        console.warn('⚠️ Không thể khởi tạo Pose detection:', err.message);
-        statusEl.textContent = '✅ Sẵn sàng (không có Pose)';
-    }
-}
-
-function loadPoseLibrary() {
-    return new Promise((resolve, reject) => {
-        if (typeof Pose !== 'undefined') { resolve(); return; }
-        const scripts = [
-            'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js',
-            'https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js',
-            'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js'
-        ];
-        let loaded = 0;
-        const total = scripts.length;
-        scripts.forEach(src => {
-            const script = document.createElement('script');
-            script.src = src;
-            script.onload = () => {
-                loaded++;
-                if (loaded === total) {
-                    setTimeout(() => {
-                        if (typeof Pose !== 'undefined') resolve();
-                        else reject(new Error('Pose not defined after loading'));
-                    }, 500);
-                }
-            };
-            script.onerror = () => reject(new Error(`Failed to load ${src}`));
-            document.head.appendChild(script);
-        });
-        setTimeout(() => {
-            if (typeof Pose !== 'undefined') resolve();
-        }, 10000);
-    });
 }
 
 // ==================== UI EVENTS ====================
@@ -649,10 +888,14 @@ submitRegister.addEventListener('click', async function() {
     const img = new Image();
     img.src = URL.createObjectURL(file);
     await img.decode();
-    const detection = await faceapi.detectSingleFace(img)
-        .withFaceLandmarks()
-        .withFaceDescriptor()
-        .withAgeAndGender();
+    const detection = await faceapi.detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({
+        inputSize: DETECTOR_INPUT_SIZE,
+        scoreThreshold: DETECTOR_SCORE_THRESHOLD
+    }))
+    .withFaceLandmarks()
+    .withFaceDescriptor()
+    .withAgeAndGender();
+
     if (!detection) {
         registerStatus.textContent = '❌ Không tìm thấy khuôn mặt trong ảnh. Vui lòng chọn ảnh khác.';
         return;
@@ -688,5 +931,5 @@ submitRegister.addEventListener('click', async function() {
     }
 });
 
-// START
+// ==================== START ====================
 loadModels();

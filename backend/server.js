@@ -1,14 +1,12 @@
 // backend/server.js
 // ===================================================================
-// FIXED VERSION:
-// - Added API Key authentication for all POST routes
-// - Converted sync file operations to async (fs.promises)
-// - In-memory cache for student descriptors to avoid reading disk every request
-// - Only save new descriptors/images when distance > 0.4 (reduce I/O)
-// - Rate limiting and security improvements
-// - Imported emotion functions from db.js (removed duplicates)
-// - Added validation for gender/age in register API
-// - Auto reset attendance at midnight
+// ENHANCED VERSION WITH:
+// - SQLite persistent storage (attendance, students, events)
+// - Winston logging
+// - WebSocket real-time notifications
+// - Full CRUD APIs for students
+// - In-memory cache for performance
+// - Telegram Bot integration
 // ===================================================================
 
 require('dotenv').config();
@@ -17,35 +15,77 @@ const cors = require('cors');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const http = require('http');
+const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
+const { createLogger, format, transports } = require('winston');
+
+// Import DB helpers
 const {
-    logEvent, registerStudent, getTodayAttendance,
+    db,
+    logEvent, registerStudent, getStudents, getTodayAttendance,
     getStudentAttendance, getStats, getVietnamTime, getStudentsWithGender,
-    getEmotionStats, getClassEmotionStats  // Imported from db
+    getEmotionStats, getClassEmotionStats,
+    logAttendance, getAttendanceByDate, clearAttendance,
+    updateStudent, deleteStudent, getStudentById
 } = require('./db');
 
+// ==================== LOGGER SETUP ====================
+const logDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+
+const logger = createLogger({
+    level: 'info',
+    format: format.combine(
+        format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        format.printf(({ level, message, timestamp }) => `${timestamp} [${level}] ${message}`)
+    ),
+    transports: [
+        new transports.Console({
+            format: format.combine(
+                format.colorize(),
+                format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+                format.printf(({ level, message, timestamp }) => `${timestamp} [${level}] ${message}`)
+            )
+        }),
+        new transports.File({ filename: path.join(logDir, 'error.log'), level: 'error' }),
+        new transports.File({ filename: path.join(logDir, 'combined.log') })
+    ]
+});
+
+// ==================== APP SETUP ====================
 const app = express();
 const PORT = process.env.PORT || 5000;
-
-// ==================== CONFIG ====================
 const API_KEY = process.env.API_KEY || 'your-secret-key-change-me';
-const DESCRIPTOR_SAVE_THRESHOLD = 0.4; // only save if distance > 0.4 to avoid excessive I/O
+const DESCRIPTOR_SAVE_THRESHOLD = 0.4;
 
-// ==================== AUTHENTICATION MIDDLEWARE ====================
+// ==================== MIDDLEWARE ====================
+app.use(cors());
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+
+// Authentication
 const authenticate = (req, res, next) => {
     const key = req.headers['x-api-key'];
     if (!key || key !== API_KEY) {
+        logger.warn(`Unauthorized attempt from ${req.ip}`);
         return res.status(401).json({ error: 'Unauthorized' });
     }
     next();
 };
 
-// ==================== RATE LIMITING ====================
+// Rate limiting
 const requestCounts = {};
 function rateLimit(maxRequests, windowMs) {
     return (req, res, next) => {
         const key = `${req.ip}:${req.path}`;
         const now = Date.now();
+        // Clean old entries periodically
+        if (Object.keys(requestCounts).length > 1000) {
+            for (const k in requestCounts) {
+                if (now > requestCounts[k].resetAt) delete requestCounts[k];
+            }
+        }
         if (!requestCounts[key] || now > requestCounts[key].resetAt) {
             requestCounts[key] = { count: 1, resetAt: now + windowMs };
             return next();
@@ -57,11 +97,6 @@ function rateLimit(maxRequests, windowMs) {
         next();
     };
 }
-
-// ==================== MIDDLEWARE ====================
-app.use(cors());
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // ==================== STATIC FILES ====================
 app.use(express.static(path.join(__dirname, '../frontend')));
@@ -80,9 +115,9 @@ let bot = null;
 if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_token_here') {
     try {
         bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-        console.log('✅ Telegram Bot đã kết nối');
-        console.log('📌 Chat ID mục tiêu:', process.env.TELEGRAM_CHAT_ID || 'CHƯA CẤU HÌNH');
+        logger.info('✅ Telegram Bot connected');
 
+        // Các lệnh bot (giữ nguyên như bạn đã có)
         bot.onText(/\/start/, (msg) => {
             bot.sendMessage(msg.chat.id, '🤖 Bot giám sát lớp học đã sẵn sàng!');
         });
@@ -103,18 +138,21 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
         bot.onText(/\/today/, async (msg) => {
             const chatId = msg.chat.id;
             try {
-                const rows = await getTodayAttendance();
+                const today = new Date().toISOString().slice(0, 10);
+                const presentIds = await getAttendanceByDate(today);
+                const presentStudents = presentIds.map(id => getStudentFromCache(id)).filter(Boolean);
                 let message = `📋 *ĐIỂM DANH HÔM NAY*\n\n`;
-                if (rows.length === 0) {
+                if (presentStudents.length === 0) {
                     message += 'Chưa có học sinh nào điểm danh.';
                 } else {
-                    rows.forEach((r, i) => {
-                        message += `${i+1}. ${r.studentName} (${r.studentId}) - ${r.timestamp}\n`;
+                    presentStudents.forEach((s, i) => {
+                        message += `${i+1}. ${s.name} (${s.id})\n`;
                     });
                 }
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
+                logger.error('Telegram /today error:', err);
             }
         });
 
@@ -129,12 +167,13 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
+                logger.error('Telegram /stats error:', err);
             }
         });
 
         bot.onText(/\/student (.+)/, async (msg, match) => {
             const chatId = msg.chat.id;
-            const id = match[1];
+            const id = match[1].trim();
             try {
                 const rows = await getStudentAttendance(id);
                 if (rows.length === 0) {
@@ -153,6 +192,7 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
+                logger.error('Telegram /student error:', err);
             }
         });
 
@@ -166,13 +206,15 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                     return;
                 }
                 let message = `😊 *Cảm xúc học sinh ${id} hôm nay:*\n\n`;
+                const total = stats.reduce((a, b) => a + b.count, 0);
                 stats.forEach(s => {
-                    const bar = '▓'.repeat(Math.round(s.count / stats.reduce((a, b) => a + b.count, 0) * 10));
+                    const bar = '▓'.repeat(Math.round(s.count / total * 10));
                     message += `${s.emotion}: ${bar} (${s.count} lần)\n`;
                 });
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
+                logger.error('Telegram /emotion error:', err);
             }
         });
 
@@ -194,6 +236,7 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi truy vấn');
+                logger.error('Telegram /classemotion error:', err);
             }
         });
 
@@ -204,6 +247,7 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
                 bot.sendMessage(chatId, '✅ Đã gửi báo cáo điểm danh.');
             } catch (err) {
                 bot.sendMessage(chatId, '❌ Lỗi gửi báo cáo');
+                logger.error('Telegram /report error:', err);
             }
         });
 
@@ -215,22 +259,38 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN !== 'your_t
             );
         });
 
+        bot.onText(/\/reset/, async (msg) => {
+            const chatId = msg.chat.id;
+            if (msg.chat.id.toString() !== process.env.TELEGRAM_CHAT_ID) {
+                bot.sendMessage(chatId, '❌ Bạn không có quyền thực hiện lệnh này.');
+                return;
+            }
+            try {
+                const today = new Date().toISOString().slice(0, 10);
+                await clearAttendance(today);
+                bot.sendMessage(chatId, `✅ Đã reset điểm danh ngày ${today}.`);
+                logger.info(`Attendance reset for ${today} by Telegram`);
+            } catch (err) {
+                bot.sendMessage(chatId, '❌ Lỗi reset điểm danh.');
+                logger.error('Telegram /reset error:', err);
+            }
+        });
+
     } catch (err) {
-        console.warn('⚠️ Không kết nối được Telegram Bot:', err.message);
+        logger.warn('⚠️ Telegram Bot connection failed:', err.message);
     }
 } else {
-    console.log('⚠️ Bỏ qua Telegram Bot (thiếu token)');
+    logger.info('⚠️ Telegram Bot disabled (no token)');
 }
 
 // ==================== PATHS & DIRS ====================
 const STUDENT_DATA_DIR = path.join(__dirname, 'database', 'student_data');
 const CROPPED_FACES_DIR = path.join(__dirname, 'database', 'cropped_faces');
-
 [path.join(__dirname, 'database'), STUDENT_DATA_DIR, CROPPED_FACES_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// ==================== IN-MEMORY CACHE ====================
+// ==================== CACHE ====================
 let studentCache = [];
 let cacheLoaded = false;
 
@@ -248,7 +308,7 @@ async function loadStudentCache() {
                 cache.push(JSON.parse(raw));
             }
         } catch (e) {
-            console.warn(`⚠️ Lỗi đọc descriptor của ${folder}:`, e.message);
+            logger.warn(`⚠️ Lỗi đọc descriptor của ${folder}: ${e.message}`);
         }
     }
     return cache;
@@ -257,7 +317,7 @@ async function loadStudentCache() {
 async function initCache() {
     studentCache = await loadStudentCache();
     cacheLoaded = true;
-    console.log(`🧠 Đã load ${studentCache.length} học sinh vào In-Memory Cache`);
+    logger.info(`🧠 Loaded ${studentCache.length} students into cache`);
 }
 
 function getStudentFromCache(studentId) {
@@ -273,8 +333,10 @@ function upsertStudentInCache(studentId, name, descriptor, gender, age) {
     student.name = name;
     if (gender) student.gender = gender;
     if (age) student.age = age;
-    student.descriptors.push(descriptor);
-    if (student.descriptors.length > 30) student.descriptors = student.descriptors.slice(-30);
+    if (descriptor) {
+        student.descriptors.push(descriptor);
+        if (student.descriptors.length > 30) student.descriptors = student.descriptors.slice(-30);
+    }
     return student;
 }
 
@@ -293,12 +355,10 @@ function euclideanDistance(arr1, arr2) {
     return Math.sqrt(sum);
 }
 
-// ==================== FIND BEST MATCH (USING CACHE) ====================
 function findBestMatch(descriptor, threshold = 0.55) {
     if (!cacheLoaded || studentCache.length === 0) return null;
     let bestMatch = null;
     let bestDistance = Infinity;
-
     for (const student of studentCache) {
         const descs = student.descriptors || [];
         if (descs.length === 0) continue;
@@ -312,36 +372,13 @@ function findBestMatch(descriptor, threshold = 0.55) {
             bestMatch = student;
         }
     }
-
     if (bestMatch && bestDistance <= threshold) {
         return { student: bestMatch, distance: bestDistance };
     }
     return null;
 }
 
-// ==================== ATTENDANCE (IN-MEMORY) ====================
-let attendance = {};
-let currentSession = new Date().toISOString().slice(0, 10);
-
-// Auto reset attendance at midnight
-setInterval(() => {
-    const today = new Date().toISOString().slice(0, 10);
-    if (today !== currentSession) {
-        attendance = {};
-        currentSession = today;
-        console.log(`🔄 Đã reset điểm danh cho ngày mới: ${today}`);
-    }
-}, 60000); // check every minute
-
-function updateAttendance(studentId, studentName) {
-    if (!attendance[currentSession]) attendance[currentSession] = [];
-    if (!attendance[currentSession].includes(studentId)) {
-        attendance[currentSession].push(studentId);
-        logEvent(studentId, studentName, 'attendance', {});
-    }
-}
-
-// ==================== STUDY SESSIONS & REPORTS ====================
+// ==================== STUDY SESSIONS ====================
 const STUDY_SESSIONS = [
     { name: 'Sáng 1', start: '07:30', end: '08:15' },
     { name: 'Sáng 2', start: '08:15', end: '09:00' },
@@ -368,30 +405,65 @@ function getCurrentSession() {
     return STUDY_SESSIONS.find(s => timeStr >= s.start && timeStr < s.end) || null;
 }
 
+// ==================== WEBSOCKET SETUP ====================
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', ws => {
+    logger.info('🟢 WebSocket client connected');
+    ws.on('close', () => logger.info('🔴 WebSocket client disconnected'));
+});
+
+function broadcast(event) {
+    const payload = JSON.stringify(event);
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(payload);
+        }
+    });
+}
+
+// ==================== ATTENDANCE (PERSISTENT) ====================
+async function updateAttendance(studentId, studentName) {
+    try {
+        const today = new Date().toISOString().slice(0, 10);
+        const existing = await getAttendanceByDate(today);
+        if (existing.includes(studentId)) return;
+        await logAttendance(studentId, studentName);
+        await logEvent(studentId, studentName, 'attendance', {});
+        broadcast({ type: 'attendance', studentId, studentName, timestamp: new Date().toISOString() });
+        logger.debug(`Attendance: ${studentName} (${studentId})`);
+    } catch (err) {
+        logger.error('updateAttendance error:', err);
+    }
+}
+
+// ==================== REPORT SENDING ====================
 let lastReportState = null;
 
 async function sendAttendanceReport(force = false) {
     if (!bot) return;
     const session = getCurrentSession();
-    if (!session) { console.log('⏰ Không trong giờ học'); return; }
-    const allStudents = studentCache; // use cache
+    if (!session) { logger.debug('⏰ Not in class time'); return; }
+    const allStudents = studentCache;
     if (allStudents.length === 0) return;
-    const present = attendance[currentSession] || [];
-    const presentIds = present.slice().sort();
+    const today = new Date().toISOString().slice(0, 10);
+    const presentIds = await getAttendanceByDate(today);
+    const presentSet = new Set(presentIds);
+    const present = allStudents.filter(s => presentSet.has(s.id));
+    const absent = allStudents.filter(s => !presentSet.has(s.id));
 
     if (!force && lastReportState &&
         lastReportState.sessionName === session.name &&
-        JSON.stringify(lastReportState.presentIds) === JSON.stringify(presentIds)) {
+        JSON.stringify(lastReportState.presentIds) === JSON.stringify(presentIds.slice().sort())) {
         return;
     }
 
-    const presentSet = new Set(present);
-    const absent = allStudents.filter(s => !presentSet.has(s.id));
     let message = `📊 *BÁO CÁO ĐIỂM DANH CA ${session.name.toUpperCase()}*\n`;
-    message += `📅 Ngày: ${currentSession}\n⏰ ${session.start} - ${session.end}\n\n`;
+    message += `📅 Ngày: ${today}\n⏰ ${session.start} - ${session.end}\n\n`;
     message += `✅ *Có mặt (${present.length}/${allStudents.length}):*\n`;
     if (present.length > 0) {
-        message += allStudents.filter(s => presentSet.has(s.id)).map((s, i) => `${i+1}. ${s.name}`).join('\n');
+        message += present.map((s, i) => `${i+1}. ${s.name}`).join('\n');
     } else {
         message += '❌ Không có học sinh nào điểm danh';
     }
@@ -400,25 +472,10 @@ async function sendAttendanceReport(force = false) {
 
     try {
         await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
-        console.log(`📨 Đã gửi báo cáo ca ${session.name}`);
-        if (present.length > 0) {
-            const firstStudent = allStudents.find(s => presentSet.has(s.id));
-            if (firstStudent) {
-                const folder = path.join(STUDENT_DATA_DIR, firstStudent.id);
-                if (fs.existsSync(folder)) {
-                    const files = fs.readdirSync(folder).filter(f => f.endsWith('.jpg'));
-                    if (files.length > 0) {
-                        await bot.sendPhoto(process.env.TELEGRAM_CHAT_ID,
-                            path.join(folder, files[files.length - 1]),
-                            { caption: `📸 Ảnh điểm danh: ${firstStudent.name} (${firstStudent.id})` }
-                        );
-                    }
-                }
-            }
-        }
-        lastReportState = { sessionName: session.name, presentIds };
+        logger.info(`📨 Report sent for session ${session.name}`);
+        lastReportState = { sessionName: session.name, presentIds: presentIds.slice().sort() };
     } catch (err) {
-        console.error('❌ Lỗi gửi báo cáo:', err.message);
+        logger.error('❌ Failed to send report:', err.message);
     }
 }
 
@@ -433,6 +490,7 @@ function scheduleReports() {
     }, 30000);
 }
 
+// ==================== LIMIT IMAGES ====================
 async function limitCroppedImages(studentId, maxCount = 10) {
     const folder = path.join(STUDENT_DATA_DIR, studentId);
     if (!fs.existsSync(folder)) return;
@@ -449,31 +507,25 @@ async function limitCroppedImages(studentId, maxCount = 10) {
 
 // ==================== API ENDPOINTS ====================
 
-// 1. Register student (protected)
+// 1. Register student
 app.post('/api/register', authenticate, rateLimit(10, 60000), async (req, res) => {
     try {
         const { studentId, name, descriptor, croppedImage, gender, age } = req.body;
-        if (!studentId || !name || !descriptor) {
-            return res.status(400).json({ error: 'Thiếu thông tin' });
-        }
-        if (!Array.isArray(descriptor) || descriptor.length !== 128) {
-            return res.status(400).json({ error: 'Descriptor phải là mảng 128 số' });
+        if (!studentId || !name || !descriptor || !Array.isArray(descriptor) || descriptor.length !== 128) {
+            return res.status(400).json({ error: 'Invalid data' });
         }
         if (getStudentFromCache(studentId)) {
-            return res.status(400).json({ error: `Học sinh ${studentId} đã tồn tại` });
+            return res.status(400).json({ error: `Student ${studentId} already exists` });
         }
-
-        // Validate gender if provided
         if (gender && !['male', 'female'].includes(gender)) {
-            return res.status(400).json({ error: 'Gender phải là male hoặc female' });
+            return res.status(400).json({ error: 'Gender must be male/female' });
         }
-        // Validate age if provided
         if (age && (typeof age !== 'number' || age < 0 || age > 120)) {
-            return res.status(400).json({ error: 'Age phải là số từ 0-120' });
+            return res.status(400).json({ error: 'Age must be 0-120' });
         }
 
         const student = upsertStudentInCache(studentId, name, descriptor, gender || null, age || null);
-        registerStudent(studentId, name, gender || null, age || null);
+        await registerStudent(studentId, name, gender || null, age || null);
         await persistStudentDescriptor(student);
 
         if (croppedImage) {
@@ -484,26 +536,26 @@ app.post('/api/register', authenticate, rateLimit(10, 60000), async (req, res) =
             await limitCroppedImages(studentId, 10);
         }
 
+        broadcast({ type: 'registration', studentId, studentName: name });
+        logger.info(`📝 Registered student ${name} (${studentId})`);
         res.json({ success: true, message: `Đã đăng ký ${name}` });
     } catch (err) {
-        console.error(err);
+        logger.error('Register error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 2. Recognize multiple faces (protected)
+// 2. Recognize multiple faces
 let lastEmotion = {};
-
 app.post('/api/recognize-multiple', authenticate, rateLimit(100, 60000), async (req, res) => {
     try {
         const { descriptors, emotions, croppedImages, ageGenders } = req.body;
         if (!descriptors || !Array.isArray(descriptors) || descriptors.length === 0) {
-            return res.status(400).json({ error: 'Yêu cầu gửi mảng descriptors' });
+            return res.status(400).json({ error: 'Descriptors required' });
         }
 
         const results = [];
         const writeJobs = [];
-
         for (let i = 0; i < descriptors.length; i++) {
             const match = findBestMatch(descriptors[i], 0.55);
             if (match) {
@@ -521,16 +573,13 @@ app.post('/api/recognize-multiple', authenticate, rateLimit(100, 60000), async (
                     gender
                 });
 
-                // Update attendance
-                updateAttendance(student.id, student.name);
+                await updateAttendance(student.id, student.name);
 
-                // Log emotion if changed
                 if (lastEmotion[student.id] !== emotion) {
-                    logEvent(student.id, student.name, 'emotion', { emotion, age, gender }, age, gender);
+                    await logEvent(student.id, student.name, 'emotion', { emotion, age, gender }, age, gender);
                     lastEmotion[student.id] = emotion;
                 }
 
-                // Save new image and descriptor only if distance > threshold (to avoid unnecessary I/O)
                 if (croppedImages && croppedImages[i] && match.distance > DESCRIPTOR_SAVE_THRESHOLD) {
                     writeJobs.push((async () => {
                         const folder = path.join(STUDENT_DATA_DIR, student.id);
@@ -541,8 +590,6 @@ app.post('/api/recognize-multiple', authenticate, rateLimit(100, 60000), async (
                             Buffer.from(base64Data, 'base64')
                         );
                         await limitCroppedImages(student.id, 10);
-
-                        // Update cache and persist descriptor
                         const updated = upsertStudentInCache(student.id, student.name, descriptors[i], gender, age);
                         await persistStudentDescriptor(updated);
                     })());
@@ -558,102 +605,133 @@ app.post('/api/recognize-multiple', authenticate, rateLimit(100, 60000), async (
                 });
             }
         }
-
-        // Execute all save operations concurrently
         await Promise.all(writeJobs);
-
         res.json({ success: true, count: results.length, results });
     } catch (err) {
-        console.error('❌ /api/recognize-multiple lỗi:', err);
+        logger.error('Recognize error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 3. Get attendance (no auth needed)
-app.get('/api/attendance', (req, res) => {
+// 3. Get attendance
+app.get('/api/attendance', async (req, res) => {
     try {
-        const session = req.query.session || currentSession;
-        const list = attendance[session] || [];
+        const session = req.query.session || new Date().toISOString().slice(0, 10);
+        const list = await getAttendanceByDate(session);
         const students = list.map(id => getStudentFromCache(id)).filter(Boolean);
         res.json({ session, count: students.length, students });
     } catch (err) {
+        logger.error('Attendance error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 4. Get all students (no auth)
+// 4. Get all students
 app.get('/api/students', async (req, res) => {
     try {
         const students = await getStudentsWithGender();
         res.json(students);
     } catch (err) {
+        logger.error('Students error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 5. Behavior alert (protected)
+// 5. Behavior alert
 app.post('/api/behavior', authenticate, rateLimit(50, 60000), async (req, res) => {
     try {
         const { studentId, behavior, timestamp } = req.body;
-        if (!studentId || !behavior) return res.status(400).json({ error: 'Thiếu thông tin' });
+        if (!studentId || !behavior) return res.status(400).json({ error: 'Missing data' });
         const student = getStudentFromCache(studentId);
-        if (!student) return res.status(404).json({ error: 'Không tìm thấy học sinh' });
-        logEvent(studentId, student.name, 'behavior', { behavior });
-        if (!bot) return res.json({ success: false, message: 'Bot chưa kết nối' });
-        const message = `🚨 *Cảnh báo hành vi!*\n\n` +
-                       `👤 ${student.name} (${student.id})\n` +
-                       `⚠️ Hành vi: ${behavior}\n` +
-                       `🕐 ${timestamp || getVietnamTime()}`;
-        await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
+        if (!student) return res.status(404).json({ error: 'Student not found' });
+        await logEvent(studentId, student.name, 'behavior', { behavior });
+        broadcast({ type: 'behavior', studentId, studentName: student.name, behavior, timestamp: timestamp || new Date().toISOString() });
+        if (bot) {
+            const message = `🚨 *Cảnh báo hành vi!*\n\n👤 ${student.name} (${student.id})\n⚠️ Hành vi: ${behavior}\n🕐 ${timestamp || getVietnamTime()}`;
+            await bot.sendMessage(process.env.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
+        }
         res.json({ success: true });
     } catch (err) {
+        logger.error('Behavior alert error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 6. Manual report (no auth)
-app.post('/api/send-report', async (req, res) => {
-    try { await sendAttendanceReport(true); res.json({ success: true, message: 'Đã gửi báo cáo' }); }
-    catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/send-report', async (req, res) => {
-    try { await sendAttendanceReport(true); res.send('✅ Báo cáo đã được gửi qua Telegram!'); }
-    catch (err) { res.status(500).send('❌ Lỗi: ' + err.message); }
-});
-
-// 7. Student attendance history
-app.get('/api/student/:id/attendance', (req, res) => {
+// 6. CRUD for students (Protected)
+app.put('/api/students/:id', authenticate, async (req, res) => {
     try {
-        const studentId = req.params.id;
-        const student = getStudentFromCache(studentId);
-        if (!student) return res.status(404).json({ error: 'Không tìm thấy' });
-        const sessions = Object.entries(attendance)
-            .filter(([, list]) => list.includes(studentId))
-            .map(([date]) => date);
-        res.json({ student: student.name, sessions, count: sessions.length });
+        const { id } = req.params;
+        const { name, gender, age } = req.body;
+        const existing = getStudentFromCache(id);
+        if (!existing) return res.status(404).json({ error: 'Student not found' });
+        const updated = await updateStudent(id, name, existing.name, gender, age);
+        if (updated === 0) return res.status(404).json({ error: 'Student not found' });
+        // Update cache
+        const cached = getStudentFromCache(id);
+        if (cached) {
+            if (name) cached.name = name;
+            if (gender) cached.gender = gender;
+            if (age !== undefined && age !== null) cached.age = age;
+        }
+        logger.info(`📝 Updated student ${id}`);
+        res.json({ success: true, message: 'Updated' });
     } catch (err) {
+        logger.error('Update student error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 8. Reset attendance (protected)
-app.delete('/api/attendance/reset', authenticate, (req, res) => {
+app.delete('/api/students/:id', authenticate, async (req, res) => {
     try {
-        attendance = {};
-        res.json({ success: true, message: 'Đã reset điểm danh' });
+        const { id } = req.params;
+        const deleted = await deleteStudent(id);
+        if (deleted === 0) return res.status(404).json({ error: 'Student not found' });
+        // Remove from cache
+        studentCache = studentCache.filter(s => s.id !== id);
+        const folder = path.join(STUDENT_DATA_DIR, id);
+        if (fs.existsSync(folder)) {
+            await fsp.rm(folder, { recursive: true, force: true });
+        }
+        logger.info(`🗑️ Deleted student ${id}`);
+        res.json({ success: true, message: 'Deleted' });
     } catch (err) {
+        logger.error('Delete student error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 9. Sample images (no auth)
+app.get('/api/students/:id', async (req, res) => {
+    try {
+        const student = await getStudentById(req.params.id);
+        if (!student) return res.status(404).json({ error: 'Student not found' });
+        res.json(student);
+    } catch (err) {
+        logger.error('Get student error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 7. Reset attendance (protected)
+app.delete('/api/attendance/reset', authenticate, async (req, res) => {
+    try {
+        const today = new Date().toISOString().slice(0, 10);
+        await clearAttendance(today);
+        logger.info(`Attendance reset for ${today}`);
+        res.json({ success: true, message: `Đã reset điểm danh ngày ${today}` });
+    } catch (err) {
+        logger.error('Reset attendance error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 8. Sample images (no auth)
 app.get('/api/sample-images', async (req, res) => {
     try {
         const dbPath = path.join(__dirname, 'database');
         const files = (await fsp.readdir(dbPath)).filter(f => /\.(jpg|jpeg|png)$/i.test(f));
         res.json({ success: true, images: files });
     } catch (err) {
+        logger.error('Sample images error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -665,30 +743,33 @@ app.get('/api/sample-image/:filename', async (req, res) => {
         const base64 = (await fsp.readFile(filePath)).toString('base64');
         res.json({ success: true, base64, filename: req.params.filename });
     } catch (err) {
+        logger.error('Sample image error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 10. Cropped face of student
+// 9. Cropped face of student
 app.get('/api/student/:id/cropped', async (req, res) => {
     try {
         const folder = path.join(STUDENT_DATA_DIR, req.params.id);
-        if (!fs.existsSync(folder)) return res.status(404).json({ error: 'Không có ảnh crop' });
+        if (!fs.existsSync(folder)) return res.status(404).json({ error: 'No cropped image' });
         const files = (await fsp.readdir(folder)).filter(f => f.endsWith('.jpg'));
-        if (files.length === 0) return res.status(404).json({ error: 'Không có ảnh crop' });
+        if (files.length === 0) return res.status(404).json({ error: 'No cropped image' });
         const base64 = (await fsp.readFile(path.join(folder, files[files.length - 1]))).toString('base64');
         res.json({ success: true, base64, filename: files[files.length - 1] });
     } catch (err) {
+        logger.error('Cropped image error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 11. Emotion stats
+// 10. Emotion stats
 app.get('/api/emotion/stats/:studentId', async (req, res) => {
     try {
         const stats = await getEmotionStats(req.params.studentId);
         res.json({ success: true, stats });
     } catch (err) {
+        logger.error('Emotion stats error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -698,45 +779,25 @@ app.get('/api/emotion/class', async (req, res) => {
         const stats = await getClassEmotionStats();
         res.json({ success: true, stats });
     } catch (err) {
+        logger.error('Class emotion error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 12. Debug
-app.get('/api/debug/students', (req, res) => {
-    res.json({ count: studentCache.length, students: studentCache.map(s => ({ id: s.id, name: s.name, descriptors: s.descriptors?.length || 0, gender: s.gender || null, age: s.age || null })) });
-});
-
-// 13. Stats and reports
+// 11. Stats
 app.get('/api/stats', async (req, res) => {
     try {
         const stats = await getStats();
         res.json(stats);
     } catch (err) {
+        logger.error('Stats error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-app.get('/api/report/week/:date', async (req, res) => {
-    try {
-        const { date } = req.params;
-        const total = studentCache.length;
-        const { db } = require('./db');
-        const present = await new Promise((resolve, reject) => {
-            db.get(`
-                SELECT COUNT(DISTINCT studentId) as count FROM events
-                WHERE date(timestamp) = ? AND action = 'attendance'
-            `, [date], (err, row) => err ? reject(err) : resolve(row?.count || 0));
-        });
-        res.json({ date, total, present, absent: total - present });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
+// 12. Behavior today
 app.get('/api/behavior/today', async (req, res) => {
     try {
-        const { db } = require('./db');
         const today = new Date().toISOString().slice(0, 10);
         const events = await new Promise((resolve, reject) => {
             db.all(`
@@ -747,225 +808,41 @@ app.get('/api/behavior/today', async (req, res) => {
         });
         res.json({ success: true, events });
     } catch (err) {
+        logger.error('Behavior today error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// PDF / Excel / CSV reports (unchanged, but using cache)
-let PDFDocument, ExcelJS;
-try { PDFDocument = require('pdfkit'); } catch (e) {}
-try { ExcelJS = require('exceljs'); } catch (e) {}
+// 13. Debug (protected)
+app.get('/api/debug/students', authenticate, (req, res) => {
+    res.json({
+        count: studentCache.length,
+        students: studentCache.map(s => ({
+            id: s.id,
+            name: s.name,
+            descriptors: s.descriptors?.length || 0,
+            gender: s.gender || null,
+            age: s.age || null
+        }))
+    });
+});
 
-app.get('/api/report/pdf', async (req, res) => {
-    if (!PDFDocument) {
-        return res.status(503).json({ error: 'pdfkit chưa được cài. Chạy: npm install pdfkit' });
-    }
+// 14. Manual report trigger (no auth, for testing)
+app.post('/api/send-report', async (req, res) => {
     try {
-        const allStudents = studentCache;
-        const today = new Date().toISOString().slice(0, 10);
-        const todayAttendance = await getTodayAttendance();
-        const presentIds = new Set(todayAttendance.map(a => a.studentId));
-        const stats = await getStats();
-
-        const doc = new PDFDocument({ margin: 40, size: 'A4' });
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="baocao_${today}.pdf"`);
-        doc.pipe(res);
-
-        doc.fontSize(18).font('Helvetica-Bold').text('BÁO CÁO ĐIỂM DANH', { align: 'center' });
-        doc.fontSize(12).font('Helvetica').text(`Ngày: ${today}`, { align: 'center' });
-        doc.moveDown();
-
-        doc.fontSize(13).font('Helvetica-Bold').text('THỐNG KÊ TỔNG QUAN');
-        doc.fontSize(11).font('Helvetica');
-        doc.text(`Tổng học sinh: ${stats.totalStudents}`);
-        doc.text(`Có mặt: ${stats.presentToday}`);
-        doc.text(`Vắng mặt: ${stats.totalStudents - stats.presentToday}`);
-        doc.text(`Tỷ lệ: ${stats.totalStudents > 0 ? Math.round(stats.presentToday / stats.totalStudents * 100) : 0}%`);
-        doc.moveDown();
-
-        doc.fontSize(13).font('Helvetica-Bold').text('DANH SÁCH CÓ MẶT');
-        doc.fontSize(10).font('Helvetica');
-        const present = allStudents.filter(s => presentIds.has(s.id));
-        if (present.length === 0) {
-            doc.text('Chưa có học sinh nào điểm danh.');
-        } else {
-            present.forEach((s, i) => {
-                const time = todayAttendance.find(a => a.studentId === s.id)?.timestamp || '';
-                doc.text(`${i+1}. ${s.name} (${s.id}) - ${time}`);
-            });
-        }
-        doc.moveDown();
-
-        doc.fontSize(13).font('Helvetica-Bold').text('DANH SÁCH VẮNG MẶT');
-        doc.fontSize(10).font('Helvetica');
-        const absent = allStudents.filter(s => !presentIds.has(s.id));
-        if (absent.length === 0) {
-            doc.text('Tất cả học sinh đều có mặt!');
-        } else {
-            absent.forEach((s, i) => doc.text(`${i+1}. ${s.name} (${s.id})`));
-        }
-
-        doc.moveDown(2);
-        doc.fontSize(9).fillColor('#888').text(`Tạo lúc: ${getVietnamTime()}`, { align: 'right' });
-        doc.end();
+        await sendAttendanceReport(true);
+        res.json({ success: true, message: 'Đã gửi báo cáo' });
     } catch (err) {
-        console.error('PDF error:', err);
+        logger.error('Manual report error:', err);
         res.status(500).json({ error: err.message });
     }
 });
-
-app.get('/api/report/excel', async (req, res) => {
-    if (!ExcelJS) {
-        return res.status(503).json({ error: 'exceljs chưa được cài. Chạy: npm install exceljs' });
-    }
+app.get('/api/send-report', async (req, res) => {
     try {
-        const allStudents = studentCache;
-        const today = new Date().toISOString().slice(0, 10);
-        const todayAttendance = await getTodayAttendance();
-        const presentIds = new Set(todayAttendance.map(a => a.studentId));
-        const presentMap = {};
-        todayAttendance.forEach(a => { presentMap[a.studentId] = a.timestamp; });
-
-        const workbook = new ExcelJS.Workbook();
-        workbook.creator = 'Smart Classroom Monitor';
-        const sheet = workbook.addWorksheet(`Điểm danh ${today}`);
-
-        sheet.columns = [
-            { header: 'STT', key: 'stt', width: 8 },
-            { header: 'Mã học sinh', key: 'id', width: 15 },
-            { header: 'Họ tên', key: 'name', width: 28 },
-            { header: 'Trạng thái', key: 'status', width: 15 },
-            { header: 'Thời gian điểm danh', key: 'time', width: 22 }
-        ];
-
-        sheet.getRow(1).eachCell(cell => {
-            cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A2E' } };
-            cell.alignment = { horizontal: 'center' };
-        });
-
-        allStudents.forEach((s, i) => {
-            const isPresent = presentIds.has(s.id);
-            const row = sheet.addRow({
-                stt: i + 1,
-                id: s.id,
-                name: s.name,
-                status: isPresent ? '✅ Có mặt' : '❌ Vắng mặt',
-                time: presentMap[s.id] || ''
-            });
-            row.getCell('status').font = { color: { argb: isPresent ? 'FF2E7D32' : 'FFC62828' } };
-            if (i % 2 === 0) {
-                row.eachCell(c => c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8F9FA' } });
-            }
-        });
-
-        sheet.addRow([]);
-        const stats = await getStats();
-        sheet.addRow(['', '', 'Tổng cộng:', allStudents.length, '']);
-        sheet.addRow(['', '', 'Có mặt:', stats.presentToday, '']);
-        sheet.addRow(['', '', 'Vắng mặt:', stats.totalStudents - stats.presentToday, '']);
-
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename="diemdanh_${today}.xlsx"`);
-        await workbook.xlsx.write(res);
-        res.end();
+        await sendAttendanceReport(true);
+        res.send('✅ Báo cáo đã được gửi qua Telegram!');
     } catch (err) {
-        console.error('Excel error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/api/report/csv', async (req, res) => {
-    try {
-        const allStudents = studentCache;
-        const today = new Date().toISOString().slice(0, 10);
-        const todayAttendance = await getTodayAttendance();
-        const presentIds = new Set(todayAttendance.map(a => a.studentId));
-        const presentMap = {};
-        todayAttendance.forEach(a => { presentMap[a.studentId] = a.timestamp; });
-
-        const headers = ['STT', 'Mã học sinh', 'Họ tên', 'Trạng thái', 'Thời gian điểm danh'];
-        const rows = allStudents.map((s, i) => [
-            i + 1,
-            s.id,
-            s.name,
-            presentIds.has(s.id) ? 'Có mặt' : 'Vắng mặt',
-            presentMap[s.id] || ''
-        ]);
-
-        const stats = await getStats();
-        const summary = [
-            [],
-            ['TỔNG KẾT'],
-            ['Tổng học sinh:', allStudents.length],
-            ['Có mặt:', stats.presentToday],
-            ['Vắng mặt:', stats.totalStudents - stats.presentToday],
-            ['Tỷ lệ:', stats.totalStudents > 0 ? (stats.presentToday / stats.totalStudents * 100).toFixed(1) + '%' : '0%']
-        ];
-
-        const csvContent = [
-            headers.join(','),
-            ...rows.map(row => row.join(',')),
-            ...summary.map(row => row.join(','))
-        ].join('\n');
-
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="diemdanh_${today}.csv"`);
-        res.send('\uFEFF' + csvContent);
-    } catch (err) {
-        console.error('CSV export error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/api/report/week-csv/:date', async (req, res) => {
-    try {
-        const { date } = req.params;
-        const total = studentCache.length;
-        const { db } = require('./db');
-
-        const startDate = new Date(date);
-        startDate.setDate(startDate.getDate() - 6);
-        const weekData = [];
-        for (let i = 0; i < 7; i++) {
-            const d = new Date(startDate);
-            d.setDate(d.getDate() + i);
-            const dateStr = d.toISOString().slice(0, 10);
-            const present = await new Promise((resolve, reject) => {
-                db.get(`
-                    SELECT COUNT(DISTINCT studentId) as count FROM events
-                    WHERE date(timestamp) = ? AND action = 'attendance'
-                `, [dateStr], (err, row) => err ? reject(err) : resolve(row?.count || 0));
-            });
-            weekData.push({
-                date: dateStr,
-                total,
-                present,
-                absent: total - present
-            });
-        }
-
-        const headers = ['Ngày', 'Tổng học sinh', 'Có mặt', 'Vắng mặt', 'Tỷ lệ (%)'];
-        const rows = weekData.map(d => [
-            d.date,
-            d.total,
-            d.present,
-            d.absent,
-            d.total > 0 ? (d.present / d.total * 100).toFixed(1) : '0'
-        ]);
-
-        const csvContent = [
-            headers.join(','),
-            ...rows.map(row => row.join(','))
-        ].join('\n');
-
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="baocao_tuan_${date}.csv"`);
-        res.send('\uFEFF' + csvContent);
-    } catch (err) {
-        console.error('CSV weekly export error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).send('❌ Lỗi: ' + err.message);
     }
 });
 
@@ -973,9 +850,9 @@ app.get('/api/report/week-csv/:date', async (req, res) => {
 (async () => {
     await initCache();
     scheduleReports();
-    app.listen(PORT, () => {
-        console.log(`🚀 Server chạy tại http://localhost:${PORT}`);
-        console.log(`📅 Session hôm nay: ${currentSession}`);
-        console.log('✅ Đã khởi tạo In-Memory Cache + lịch gửi báo cáo tự động');
+    server.listen(PORT, () => {
+        logger.info(`🚀 Server running at http://localhost:${PORT}`);
+        logger.info(`📅 Today's session: ${new Date().toISOString().slice(0, 10)}`);
+        logger.info(`✅ Cache loaded, WebSocket ready, auto reports scheduled`);
     });
 })();

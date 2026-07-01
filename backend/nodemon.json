@@ -1,0 +1,9 @@
+{
+  "ignore": [
+    "database/student_data/*",
+    "database/*.db",
+    "logs/*"
+  ],
+  "watch": ["server.js", "db.js", "package.json"],
+  "ext": "js,json"
+}
